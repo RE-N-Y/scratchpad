@@ -13,7 +13,7 @@ from einops import rearrange, reduce, repeat
 from .layers import convolve, normalise, Convolution, Projection, Embedding, Selformer
 from .toolkit import *
 from .dataloader import *
-from .lpips import LPIPS
+from .models.lpips import LPIPS
 
 import wandb
 import click
@@ -49,12 +49,12 @@ class Resnet(Module):
     residual:Convolution
     output:Convolution
 
-    def __init__(self, nin:int, non:int, use_bias=True, key=None):
+    def __init__(self, nin:int, non:int, bias=True, key=None):
         key = RNG(key)
-        self.input = Convolution(nin, nin, kernel=3, padding=1, use_bias=use_bias, key=next(key))
+        self.input = Convolution(nin, nin, kernel=3, padding=1, bias=bias, key=next(key))
         self.downsample = Downsample()
-        self.residual = Convolution(nin, non, kernel=1, padding=0, use_bias=False, key=next(key))
-        self.output = Convolution(nin, non, kernel=3, padding=1, use_bias=use_bias, key=next(key))
+        self.residual = Convolution(nin, non, kernel=1, padding=0, bias=False, key=next(key))
+        self.output = Convolution(nin, non, kernel=3, padding=1, bias=bias, key=next(key))
 
 
     def __call__(self, x:Float[Array, "h w c"], key=None):
@@ -73,16 +73,16 @@ class Discriminator(Module):
     middle:Projection
     cls:Projection
 
-    def __init__(self, features, use_bias=True, key=None):
+    def __init__(self, features, bias=True, key=None):
         key = RNG(key)
         [first, *_, last] = features
         ninnon = list(zip(features[:-1], features[1:]))
 
         self.stem = Convolution(3, first, kernel=3, padding=1, key=next(key))
-        self.layers = [Resnet(nin, non, use_bias=use_bias, key=next(key)) for nin, non in ninnon]
+        self.layers = [Resnet(nin, non, bias=bias, key=next(key)) for nin, non in ninnon]
         self.out = Convolution(last, last, kernel=3, padding=1, key=next(key))
-        self.middle = Projection(4 * 4 * last, last, use_bias=use_bias, key=next(key))
-        self.cls = Projection(last, 1, use_bias=use_bias, key=next(key))
+        self.middle = Projection(4 * 4 * last, last, bias=bias, key=next(key))
+        self.cls = Projection(last, 1, bias=bias, key=next(key))
 
     @forward
     def __call__(self, x:Float[Array, "h w c"], key=None) -> Float[Array, ""]:
@@ -106,14 +106,14 @@ class VectorQuantiser(Module):
     pages:int = static_field()
     beta:float = static_field()
 
-    def __init__(self, features:int, codes:int, pages:int, beta:float=0.25, use_bias=True, key=None):
+    def __init__(self, features:int, codes:int, pages:int, beta:float=0.25, bias=True, key=None):
         key = RNG(key)
 
         weight = jr.normal(next(key), (pages, codes))
         self.codebook = Embedding(pages, codes, weight=weight, key=next(key))
 
-        self.input = Projection(features, codes, use_bias=use_bias, key=next(key))
-        self.output = Projection(codes, features, use_bias=use_bias, key=next(key))
+        self.input = Projection(features, codes, bias=bias, key=next(key))
+        self.output = Projection(codes, features, bias=bias, key=next(key))
         self.pages = pages
         self.beta = beta
 
@@ -142,15 +142,15 @@ class ViTQuantiser(Module):
     patch:int = static_field()
 
 
-    def __init__(self, features:int=768, codes:int=16, pages:int=8192, heads:int=12, depth:int=12, patch:int=8, size:int=256, dropout:float=0, use_bias=True, key=None):
+    def __init__(self, features:int=768, codes:int=16, pages:int=8192, heads:int=12, depth:int=12, patch:int=8, size:int=256, dropout:float=0, bias=True, key=None):
         key = RNG(key)
         self.size = size
         self.patch = patch
-        self.input = Convolution(3, features, patch, stride=patch, use_bias=use_bias, key=next(key))
-        self.encoder = nn.Sequential([Selformer(features, heads=heads, dropout=dropout, use_bias=use_bias, key=next(key)) for _ in range(depth)])
-        self.quantiser = VectorQuantiser(features, codes, pages, use_bias=use_bias, key=next(key))
-        self.decoder = nn.Sequential([Selformer(features, heads=heads, dropout=dropout, use_bias=use_bias, key=next(key)) for _ in range(depth)])
-        self.output = Convolution(features, 3 * patch * patch, patch, stride=patch, use_bias=use_bias, key=next(key))
+        self.input = Convolution(3, features, patch, stride=patch, bias=bias, key=next(key))
+        self.encoder = nn.Sequential([Selformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)])
+        self.quantiser = VectorQuantiser(features, codes, pages, bias=bias, key=next(key))
+        self.decoder = nn.Sequential([Selformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)])
+        self.output = Convolution(features, 3 * patch * patch, patch, stride=patch, bias=bias, key=next(key))
 
     @forward
     def __call__(self, x:Float[Array, "h w c"], key=None):
@@ -195,8 +195,8 @@ def train(**config):
     
     
     lpips = LPIPS.load("weights/lpips.weights")
-    D = Discriminator(features=[128,256,512,512,512,512,512], use_bias=config["use_bias"], key=next(key))
-    G = ViTQuantiser(config["features"], heads=config["heads"], depth=config["depths"], dropout=config["dropout"], use_bias=config["use_bias"], key=next(key))
+    D = Discriminator(features=[128,256,512,512,512,512,512], bias=config["bias"], key=next(key))
+    G = ViTQuantiser(config["features"], heads=config["heads"], depth=config["depths"], dropout=config["dropout"], bias=config["bias"], key=next(key))
     D, G, lpips = cast(ftype)(D), cast(ftype)(G), cast(ftype)(lpips)
 
     Doptim, Goptim = optax.adamw(config["lr"], 0.9, 0.95), optax.adamw(config["lr"], 0.9, 0.95)

@@ -5,7 +5,7 @@ import jax.scipy as jsp
 import numpy as onp
 from equinox import nn, static_field, Module
 from einops import rearrange, reduce, repeat
-from .toolkit import RNG, forward
+from toolkit import RNG, forward
 
 def translation_matrix(tx, ty):
     return jnp.array([

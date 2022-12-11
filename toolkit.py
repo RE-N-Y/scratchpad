@@ -2,6 +2,7 @@ import jax
 import jax.random as jr
 import jax.tree_util as jtu
 import equinox
+from equinox import Module
 from equinox import filter_vmap as vmap, filter_pmap as pmap, filter_value_and_grad as value_and_grad
 from einops import rearrange
 from functools import partial

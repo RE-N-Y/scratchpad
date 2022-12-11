@@ -6,12 +6,20 @@ from jaxtyping import Array, Float, Integer
 import numpy as onp
 from einops import rearrange, repeat, reduce
 from equinox import nn, static_field, Module
-from .toolkit import RNG
+from toolkit import RNG
+from functools import partial
 
 pair = lambda t : (t,t)
 lecun = jax.nn.initializers.lecun_normal()
 xavier = jax.nn.initializers.xavier_normal()
-ACTS = { "gelu":jax.nn.gelu, "tanh":jax.nn.tanh, "relu":jax.nn.relu }
+
+ACTS = { 
+    "gelu":jax.nn.gelu, 
+    "egelu":partial(jax.nn.gelu, approximate=False), 
+    "agelu":lambda x : x * jax.nn.sigmoid(1.702 * x),
+    "tanh":jax.nn.tanh,
+    "relu":jax.nn.relu 
+}
 
 FloatArray = Float[Array, "..."]
 IntArray = Integer[Array, "..."]
@@ -38,9 +46,9 @@ class Convolution(Module):
     groups:int = static_field()
 
 
-    def __init__(self, nin, non, kernel:int=3, stride:int=1, padding:int=0, groups:int=1, use_bias=True, key=None):
+    def __init__(self, nin, non, kernel:int=3, stride:int=1, padding:int=0, groups:int=1, bias=True, key=None):
         self.weight = lecun(key, (kernel, kernel, nin, non))
-        self.bias = jnp.zeros((non,)) if use_bias else None
+        self.bias = jnp.zeros((non,)) if bias else None
         self.kernel, self.stride, self.padding, self.groups = kernel, stride, padding, groups
 
     def __call__(self, x:Float[Array, "h w c"], key=None):
@@ -55,7 +63,7 @@ class Maxpool(Module):
     def __init__(self, window): self.window = window
     def __call__(self, x:Float[Array, "h w c"], key=None): 
         kh, kw = self.window
-        return reduce(x, '(h kh) (w kw) c -> h w c', kh=kh, kw=kw)
+        return reduce(x, '(h kh) (w kw) c -> h w c', 'max', kh=kh, kw=kw)
 
 class Embedding(Module):
     pages:int = static_field()
@@ -72,9 +80,9 @@ class Projection(Module):
     weight:jnp.ndarray
     bias:jnp.ndarray
 
-    def __init__(self, nin, non, use_bias=True, scale=.02, key=None):
+    def __init__(self, nin, non, bias=True, scale=.02, key=None):
         self.weight = jr.normal(key, (nin, non)) * scale
-        self.bias = jnp.zeros((non,)) if use_bias else None
+        self.bias = jnp.zeros((non,)) if bias else None
 
     def __call__(self, x:FloatArray, key=None):
         x = x @ self.weight
@@ -84,7 +92,7 @@ class Projection(Module):
 class Layernorm(Module):
     weight:jnp.ndarray
     bias:jnp.ndarray
-    eps:float = static_field()
+    eps:float
 
     def __init__(self, shape, affine=True, eps=1e-12, key=None):
         self.weight = jnp.ones(shape) if affine else None
@@ -110,17 +118,17 @@ class SelfAttention(Module):
     features:int = static_field()
     scale:float = static_field()
 
-    def __init__(self, features:int, heads:int=12, dropout:float=0, use_bias=True, key=None):
+    def __init__(self, features:int, heads:int=12, dropout:float=0, bias=True, key=None):
         key = RNG(key)
 
         self.heads = heads
         self.features = features
         self.scale = onp.sqrt(features // heads)
 
-        self.query = Projection(features, features, use_bias=use_bias, key=next(key))
-        self.key = Projection(features, features, use_bias=use_bias, key=next(key))
-        self.value = Projection(features, features, use_bias=use_bias, key=next(key))
-        self.out = Projection(features, features, use_bias=use_bias, key=next(key))
+        self.query = Projection(features, features, bias=bias, key=next(key))
+        self.key = Projection(features, features, bias=bias, key=next(key))
+        self.value = Projection(features, features, bias=bias, key=next(key))
+        self.out = Projection(features, features, bias=bias, key=next(key))
         self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x:Float[Array, "n d"], key=None):
@@ -148,17 +156,17 @@ class CrossAttention(Module):
     features:int = static_field()
     scale:float = static_field()
 
-    def __init__(self, features:int, context:int,  heads:int=12, dropout:float = 0, use_bias=False, key=None):
+    def __init__(self, features:int, context:int,  heads:int=12, dropout:float = 0, bias=False, key=None):
         key = RNG(key)
 
         self.heads = heads
         self.features = features
         self.scale = onp.sqrt(features // heads)
 
-        self.query = Projection(features, features, use_bias=use_bias, key=next(key))
-        self.key = Projection(context, features, use_bias=use_bias, key=next(key))
-        self.value = Projection(context, features, use_bias=use_bias, key=next(key))
-        self.out = Projection(features, features, use_bias=use_bias, key=next(key))
+        self.query = Projection(features, features, bias=bias, key=next(key))
+        self.key = Projection(context, features, bias=bias, key=next(key))
+        self.value = Projection(context, features, bias=bias, key=next(key))
+        self.out = Projection(features, features, bias=bias, key=next(key))
         self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x:Float[Array, "n d"], ctx:Float[Array, "m c"], key=None):
@@ -181,19 +189,19 @@ class MLP(Module):
     dropout:nn.Dropout
     activation:str = static_field()
 
-    def __init__(self, features:int, activation:str="gelu", dropout:float=0, use_bias=True, key=None):
+    def __init__(self, features:int, activation:str="gelu", dropout:float=0, bias=True, key=None):
         key = RNG(key)
 
-        self.input = Projection(features, 4 * features, use_bias=use_bias, key=next(key))
-        self.output = Projection(4 * features, features, use_bias=use_bias, key=next(key))
+        self.input = Projection(features, 4 * features, bias=bias, key=next(key))
+        self.output = Projection(4 * features, features, bias=bias, key=next(key))
         self.dropout = nn.Dropout(dropout)
-        self.activation = activation
+        self.activation = Activation(activation)
 
     def __call__(self, x:Float[Array, "n d"], key=None):
         ikey, okey = jr.split(key)
 
         x = self.input(x)
-        x = self.dropout(ACTS[self.activation](x), key = ikey)
+        x = self.dropout(self.activation(x), key = ikey)
         x = self.dropout(self.output(x), key = okey)
 
         return x
@@ -204,11 +212,11 @@ class Selformer(Module):
     prenorm:Layernorm
     postnorm:Layernorm
 
-    def __init__(self, features:int, heads:int=12, dropout:float=0, use_bias=True, key=None):
+    def __init__(self, features:int, heads:int=12, dropout:float=0, bias=True, key=None):
         key = RNG(key)
         self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
-        self.attention = SelfAttention(features, heads=heads, dropout=dropout, use_bias=use_bias, key=next(key))
-        self.mlp = MLP(features, dropout=dropout, use_bias=use_bias, key=next(key))
+        self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
+        self.mlp = MLP(features, dropout=dropout, bias=bias, key=next(key))
 
     def __call__(self, x:Float[Array, "n d"], key=None):
         akey, okey = jr.split(key)
@@ -224,11 +232,11 @@ class Crossformer(Module):
     kvnorm:Layernorm
     postnorm:Layernorm
 
-    def __init__(self, features:int, context:int, heads:int=12, dropout:float=0, use_bias=True, key=None):
+    def __init__(self, features:int, context:int, heads:int=12, dropout:float=0, bias=True, key=None):
         key = RNG(key)
         self.qnorm, self.kvnorm, self.postnorm = Layernorm([features]), Layernorm([context]), Layernorm([features])
-        self.attention = CrossAttention(features, context, heads=heads, dropout=dropout, use_bias=use_bias, key=next(key))
-        self.mlp = MLP(features, dropout=dropout, use_bias=use_bias, key=next(key))
+        self.attention = CrossAttention(features, context, heads=heads, dropout=dropout, bias=bias, key=next(key))
+        self.mlp = MLP(features, dropout=dropout, bias=bias, key=next(key))
 
     def __call__(self, x:Float[Array, "n d"], ctx:Float[Array, "m c"], key=None):
         akey, okey = jr.split(key)

@@ -13,7 +13,7 @@ from einops import rearrange, reduce, repeat
 from .layers import convolve, normalise, Convolution, Projection, Embedding, Selformer
 from .toolkit import *
 from .dataloader import *
-from .lpips import LPIPS
+from .models.lpips import LPIPS
 
 import wandb
 import click

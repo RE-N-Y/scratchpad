@@ -18,11 +18,11 @@ class Resnet(Module):
     layernorm:Layernorm
     mlp:MLP
     
-    def __init__(self, features, use_bias=True, key=None):
+    def __init__(self, features, bias=True, key=None):
         key = RNG(key)
-        self.depthwise = Convolution(features, features, kernel=7, padding=3, groups=features, use_bias=use_bias, key=next(key))
+        self.depthwise = Convolution(features, features, kernel=7, padding=3, groups=features, bias=bias, key=next(key))
         self.layernorm = Layernorm((features,))
-        self.mlp = MLP(features, use_bias=use_bias, key=next(key))
+        self.mlp = MLP(features, bias=bias, key=next(key))
 
     def __call__(self, x, key=None):
         x = self.mlp(self.layernorm(self.depthwise(x))) + x
@@ -32,9 +32,9 @@ class Upsample(Module):
     layer:Convolution
     scale:float = static_field()
 
-    def __init__(self, nin, non, scale=2, use_bias=True, key=None):
+    def __init__(self, nin, non, scale=2, bias=True, key=None):
         self.scale = scale
-        self.layer = Convolution(nin, non, kernel=3, padding=1, use_bias=use_bias, key=key)
+        self.layer = Convolution(nin, non, kernel=3, padding=1, bias=bias, key=key)
     
     def __call__(self, x, key=None):
         h, w, c = x.shape
@@ -61,7 +61,7 @@ class UNet(Module):
     decoder:list
     output:Convolution
 
-    def __init__(self, vocab:int, features:list, blocks:int=3, heads=8, use_bias=True, key=None):
+    def __init__(self, vocab:int, features:list, blocks:int=3, heads=8, bias=True, key=None):
         key = RNG(key)
         [first, *_, last] = features
         ninnon = list(zip(features[:-1], features[1:]))
@@ -70,24 +70,24 @@ class UNet(Module):
         # TODO: use blocks argument
         
         down = lambda nin, non : (
-            Resnet(nin, use_bias=use_bias, key=next(key)),
-            Resnet(nin, use_bias=use_bias, key=next(key)),
-            Resnet(nin, use_bias=use_bias, key=next(key)),
-            Downsample(nin, non, use_bias=use_bias, key=next(key))
+            Resnet(nin, bias=bias, key=next(key)),
+            Resnet(nin, bias=bias, key=next(key)),
+            Resnet(nin, bias=bias, key=next(key)),
+            Downsample(nin, non, bias=bias, key=next(key))
         )
 
         up = lambda nin, non : (
-            Upsample(non, nin, use_bias=use_bias, key=next(key)),
-            Resnet(nin, use_bias=use_bias, key=next(key)),
-            Resnet(nin, use_bias=use_bias, key=next(key)),
-            Resnet(nin, use_bias=use_bias, key=next(key)),
+            Upsample(non, nin, bias=bias, key=next(key)),
+            Resnet(nin, bias=bias, key=next(key)),
+            Resnet(nin, bias=bias, key=next(key)),
+            Resnet(nin, bias=bias, key=next(key)),
         )
 
-        self.input = Convolution(vocab, first, kernel=3, padding=1, use_bias=use_bias, key=next(key))
+        self.input = Convolution(vocab, first, kernel=3, padding=1, bias=bias, key=next(key))
         self.encoder = [down(nin,non) for nin,non in ninnon]
-        self.attention = SelfAttention(features=last, heads=heads, use_bias=use_bias, key=next(key))
+        self.attention = SelfAttention(features=last, heads=heads, bias=bias, key=next(key))
         self.decoder = [up(nin,non) for nin,non in ninnon]
-        self.output = Convolution(first, vocab, kernel=3, padding=1, use_bias=use_bias, key=next(key))
+        self.output = Convolution(first, vocab, kernel=3, padding=1, bias=bias, key=next(key))
 
     @forward
     def __call__(self, x, key=None):
