@@ -5,14 +5,34 @@ from jaxtyping import Array, Float
 
 import equinox
 from equinox import nn, static_field, Module
-from layers import Activation, Embedding, Layernorm, Convolution, Projection
+from layers import Activation, Embedding, Layernorm, Convolution, Projection, normalise
 from einops import rearrange, reduce, repeat
-from toolkit import RNG
+from toolkit import RNG, forward
 
 import math
 import gdown
 import numpy as onp
 from pathlib import Path
+
+KEY = jr.PRNGKey(42)
+CFG = { 
+    "base":{ 
+        "id":"1F_f_T0mdxtjkmiKmSPQKSQ7EcjnDN1hr", 
+        "net":{ 
+            "vision":{ "length":50, "features":768, "heads":12, "depth":12, "size":224, "patch":32, "bias":True, "eps":1e-5, "key":KEY }, 
+            "text":{ "length":77, "vocab":49408, "features":512, "heads":8, "depth":12, "eps":1e-5, "bias":True, "key":KEY }, 
+            "common":{ "features":512, "key":KEY }
+        } 
+    }, 
+    "large":{ 
+        "id":"174oJZbluLI9kjq79Lvojz6zQxotn7a4_", 
+        "net":{ 
+            "vision":{ "length":50, "features":1024, "heads":16, "depth":24, "size":224, "patch":14, "bias":True, "eps":1e-5, "key":KEY }, 
+            "text":{ "length":77, "vocab":49408, "features":768, "heads":12, "depth":12, "eps":1e-5, "bias":True, "key":KEY }, 
+            "common":{ "features":768, "key":KEY }
+        } 
+    } 
+}
 
 class PatchEmbeddings(Module):
     projection:Convolution
@@ -190,6 +210,7 @@ class VisionTransformer(Module):
             for _ in range(depth)
         ]
 
+    @forward
     def __call__(self, image, mask=None, key=None):
         key = RNG(key)
         embeddings = self.embeddings(image, key=next(key))
@@ -228,6 +249,7 @@ class TextTransformer(Module):
             for _ in range(depth)
         ]
 
+    @forward
     def __call__(self, tokens, mask=None, key=None):
         key = RNG(key)
         hiddens = self.embeddings(tokens)
@@ -256,45 +278,28 @@ class CLIP(Module):
 
     @classmethod
     def load(cls, name="base"):
-        key = jr.PRNGKey(42)
-        cache = Path("~/.cache/research")
-        cfg = { 
-            "base":{ 
-                "id":"1F_f_T0mdxtjkmiKmSPQKSQ7EcjnDN1hr", 
-                "net":{ 
-                    "vision":{ "length":50, "features":768, "heads":12, "size":224, "patch":32, "bias":False, "eps":1e-5, "key":key }, 
-                    "text":{ "length":77, "vocab":49408, "features":512, "heads":8, "eps":1e-5, "key":key }, 
-                    "common":{ "features":512, "key":key }
-                } 
-            }, 
-            "large":{ 
-                "id":"174oJZbluLI9kjq79Lvojz6zQxotn7a4_", 
-                "net":{ 
-                    "vision":{ "length":50, "features":1024, "heads":16, "size":224, "patch":14, "bias":False, "eps":1e-5, "key":key }, 
-                    "text":{ "length":77, "vocab":49408, "features":512, "heads":8, "eps":1e-5, "key":key }, 
-                    "common":{ "features":768, "key":key }
-                } 
-            } 
-        }
+        file = Path.home() / f".cache/research/clip-{name}.weight"
+        if not file.exists(): gdown.download(id=CFG[name]["id"], output=str(file))
 
-        file = gdown.download(id="", output=cache)
-        vision = VisionTransformer(**cfg[name]["net"]["vision"])
-        text = TextTransformer(**cfg[name]["net"]["vision"])
-        model = cls(text=text, vision=vision, **cfg[name]["net"]["common"])
+        vision = VisionTransformer(**CFG[name]["net"]["vision"])
+        text = TextTransformer(**CFG[name]["net"]["text"])
+        model = cls(text=text, vision=vision, **CFG[name]["net"]["common"])
         model = equinox.tree_deserialise_leaves(file, model)
 
         return model
 
     def __call__(self, tokens, images, tmask=None, imask=None, key=None):
         tkey, ikey = jr.split(key)
-        _, text = self.text(tokens, mask=tmask, key=tkey)
-        _, vision = self.vision(images, mask=imask, key=ikey)
+        _, temb = self.text(tokens, mask=tmask, key=tkey)
+        _, vemb = self.vision(images, mask=imask, key=ikey)
 
-        text, vision = self.tout(text), self.vout(vision)
-        text = text / jnp.linalg.norm(text, axis = -1, keepdims = True)
-        vision = vision / jnp.linalg.norm(vision, axis = -1, keepdims = True)
+        text, vision = self.tout(temb), self.vout(vemb)
+        text, vision = normalise(text), normalise(vision)
+
+        # text = text / jnp.linalg.norm(text, axis=-1, keepdims=True)
+        # vision = vision / jnp.linalg.norm(vision, axis=-1, keepdims=True)
 
         scale = jnp.exp(self.scale)
-        logits = text @ vision.T * scale
+        logit = text @ vision.T * scale
 
-        return logits
+        return logit, temb, vemb

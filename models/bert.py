@@ -12,6 +12,18 @@ import gdown
 import numpy as onp
 from pathlib import Path
 
+KEY = jr.PRNGKey(42)
+CFG = {
+    "base": { 
+        "id":"1T8XSTpch7aLzfcoWu2nugTeLQWqpZ3Lu", 
+        "net":{ "length":512, "vocab":30522, "features":768, "heads":12, "depth":12, "eps":1e-12, "key":KEY } 
+    }, 
+    "large": { 
+        "id":"1dc4nFEsshr0QarWPIb5fSWzONGmbDZsC", 
+        "net":{ "length":512, "vocab":30522, "features":1024, "heads":16, "depth":24, "eps":1e-12, "key":KEY } 
+    }
+}
+
 class BERTEmbeddings(Module):
     wte:Embedding
     wpe:Embedding
@@ -152,28 +164,16 @@ class BERT(Module):
 
     @classmethod
     def load(cls, name="base"):
-        key = jr.PRNGKey(42)
-        cache = Path("~/.cache/research")
-        cfg = {
-            "base": { 
-                "id":"1T8XSTpch7aLzfcoWu2nugTeLQWqpZ3Lu", 
-                "net":{ "length":512, "vocab":30522, "features":768, "heads":12, "depth":12, "eps":1e-12, "key":key } 
-            }, 
-            "large": { 
-                "id":"1dc4nFEsshr0QarWPIb5fSWzONGmbDZsC", 
-                "net":{ "length":512, "vocab":30522, "features":1024, "heads":16, "depth":24, "eps":1e-12, "key":key } 
-            }
-        }
-        
-        file = gdown.download(id=cfg[name]["id"], output=cache)
-        model = equinox.tree_deserialise_leaves(file, cls(**cfg[name]["net"]))
+        file = Path.home() / f".cache/research/bert-{name}-uncased.weight"
+        if not file.exists(): gdown.download(id=CFG[name]["id"], output=str(file))
+        model = equinox.tree_deserialise_leaves(file, cls(**CFG[name]["net"]))
 
         return model
 
     @forward
-    def __call__(self, tokens, mask=None, key=None):
+    def __call__(self, tokens, types=None, positions=None, mask=None, key=None):
         key = RNG(key)
-        hiddens = self.embeddings(tokens)
+        hiddens = self.embeddings(tokens, positions=positions, types=types, key=next(key))
         for block in self.encoder: hiddens = block(hiddens, mask=mask, key=next(key))
         
         return hiddens

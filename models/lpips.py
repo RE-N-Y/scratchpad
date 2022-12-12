@@ -59,8 +59,8 @@ class LPIPS(Module):
     @classmethod
     def load(cls):
         key = jr.PRNGKey(42)
-        cache = Path("~/.cache/research")
-        file = gdown.download(id="1nuQk5TurcKXu8krM8DxKXpzDiFeVSl9b", output=cache)
+        file = Path.home() / ".cache/research/lpips.weight"
+        if not file.exists(): gdown.download(id="1nuQk5TurcKXu8krM8DxKXpzDiFeVSl9b", output=str(file))
         model = equinox.tree_deserialise_leaves(file, cls(key=key))
 
         return model
