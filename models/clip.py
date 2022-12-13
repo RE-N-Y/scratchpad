@@ -296,9 +296,6 @@ class CLIP(Module):
         text, vision = self.tout(temb), self.vout(vemb)
         text, vision = normalise(text), normalise(vision)
 
-        # text = text / jnp.linalg.norm(text, axis=-1, keepdims=True)
-        # vision = vision / jnp.linalg.norm(vision, axis=-1, keepdims=True)
-
         scale = jnp.exp(self.scale)
         logit = text @ vision.T * scale
 
