@@ -67,6 +67,7 @@ class LPIPS(Module):
 
     @forward
     def __call__(self, x, y, key=None):
+        eps = 1e-10
         features = {}
         difference = 0.
 
@@ -78,9 +79,8 @@ class LPIPS(Module):
         _, features['y'] = self.backbone(y, self.slices)
 
         for idx, (x, y) in enumerate(zip(features['x'], features['y'])):
-            d = normalise(x) - normalise(y)
+            d = normalise(x, eps=eps) - normalise(y, eps=eps)
             d = reduce(self.linears[idx](d ** 2), 'h w c -> 1 1 c', 'mean')
             difference += d
 
         return difference
-    

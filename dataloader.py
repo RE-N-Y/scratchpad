@@ -3,23 +3,39 @@ import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 
 import jax
+import numpy as onp
+from einops import rearrange
+from PIL import Image
 import pickle as pkl
 from pathlib import Path
-from PIL import Image
-from einops import reduce
+
+# ImageNet [0.485, 0.456, 0.406] [0.229, 0.224, 0.225]
+# Animefaces [0.00268127, 0.00241666, 0.002342] [1.2911796 , 1.2961912 , 1.25518782]
 
 class ImageDataset(Dataset):
-    def __init__(self, folder:Path, augmentation=[], size=256):
+    def __init__(self, folder:Path, augmentations=[]):
         self.images = list(folder.glob("**/*.jpg"))
-        self.transform = T.Compose([T.Resize(size), T.ToTensor(), *augmentation])
+        self.transform = T.Compose([*augmentations, T.ToTensor()])
+        self.mean = torch.Tensor([.5,.5,.5]) # torch.Tensor([0.485, 0.456, 0.406])
+        self.std = torch.Tensor([.5,.5,.5]) # torch.Tensor([0.229, 0.224, 0.225])
 
     def __len__(self): return len(self.images)
 
     def __getitem__(self, idx:int):
         image = Image.open(self.images[idx])
         image = self.transform(image)
+        image = rearrange(image, 'c h w -> h w c')
+        image = (image - self.mean) / self.std
 
         return image
+
+    def tensor_to_image(self, tensor):
+        tensor = onp.array(tensor)
+        tensor = tensor * self.std.numpy() + self.mean.numpy()
+        tensor = tensor * 255
+        tensor = onp.rint(tensor).clip(0,255).astype(onp.uint8)
+
+        return Image.fromarray(tensor)
 
 class MemoryDataset(Dataset):
     def __init__(self, file:Path):

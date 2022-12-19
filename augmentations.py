@@ -41,7 +41,7 @@ def scale_matrix(s):
 
 
 def apply_affine(image, matrix, method="linear", mode="reflect"):
-    H, W, C, dtype = image.shape, image.dtype
+    H, W, C = image.shape
     samplers = { "nearest": 0, "linear": 1 }
 
     y, x = jnp.linspace(-H/2, H/2, num=H) , jnp.linspace(-W/2, W/2, num=W)
@@ -53,12 +53,12 @@ def apply_affine(image, matrix, method="linear", mode="reflect"):
     # [M, M, M, 0] >> depth
     # [0, 0, 0, 1] >> channels
 
-    matrix = matrix.astype(dtype)
-    transform = jnp.eye(4, dtype=dtype)
+    matrix = matrix.astype(image.dtype)
+    transform = jnp.eye(4, dtype=image.dtype)
     transform = transform.at[:-1,:-1].set(matrix)
     coordinates = coordinates @ transform
 
-    coordinates += jnp.array([H/2, W/2, 0, 0])
+    coordinates += jnp.array([H/2, W/2, 0, 0]) # adjust coordinates
     coordinates = jnp.delete(coordinates, -2, axis=-1) # delete "v" from 'h w v c yx(v)c'
     coordinates = rearrange(coordinates, 'h w v c yxc -> yxc (h w v c)')
 
@@ -109,8 +109,8 @@ class RandomAffine(Module):
 
     def __call__(self, image, key=None):
         key = RNG(key)
-        h, w, c, dtype = image.shape, image.dtype
-        uniform = lambda minval, maxval : jr.uniform(next(key), minval=minval, maxval=maxval, dtype=dtype)
+        h, w, c = image.shape
+        uniform = lambda minval, maxval : jr.uniform(next(key), minval=minval, maxval=maxval, dtype=image.dtype)
 
         scale = uniform(minval=1.0, maxval=self.scale)
         tx = uniform(minval=-self.translate, maxval=self.translate) * w
@@ -147,7 +147,7 @@ class RandomCutout(Module):
 
     def __call__(self, x, key=None):
         key = RNG(key)
-        h, w, c, dtype = x.shape, x.dtype
+        h, w, c = x.shape
 
         cut_x, cut_y = int(w * self.ratio + 0.5), int(h * self.ratio + 0.5)
         offset_x = jr.randint(next(key), (1, 1), 0, w + (1 - cut_x % 2))
@@ -159,7 +159,7 @@ class RandomCutout(Module):
         grid_x = jnp.clip(grid_x + offset_x - cut_x // 2, 0, w-1)
         grid_y = jnp.clip(grid_y + offset_y - cut_y // 2, 0, h-1)
 
-        mask = jnp.ones((h,w), dtype=dtype)
+        mask = jnp.ones((h,w), dtype=x.dtype)
         mask = mask.at[grid_y, grid_x].set(0)
         x *= rearrange(mask, 'h w -> h w 1')
 
