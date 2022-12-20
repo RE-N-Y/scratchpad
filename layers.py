@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array, Float, Integer
 
+import math
 import numpy as onp
 from einops import rearrange, repeat, reduce
 from equinox import nn, static_field, Module
@@ -17,6 +18,7 @@ ACTS = {
     "gelu":jax.nn.gelu, 
     "egelu":partial(jax.nn.gelu, approximate=False), 
     "agelu":lambda x : x * jax.nn.sigmoid(1.702 * x),
+    "ngelu":lambda x : .5 * x * (1. + jax.lax.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 + x ** 3))),
     "tanh":jax.nn.tanh,
     "relu":jax.nn.relu 
 }
