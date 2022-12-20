@@ -3,17 +3,23 @@ import jax.numpy as jnp
 import jax.random as jr
 from jaxtyping import Array, Float
 
-import numpy as onp
-import optax
 import equinox
 from equinox import nn, static_field, Module
 from equinox.serialisation import tree_serialise_leaves as save
 from equinox.serialisation import tree_deserialise_leaves as load
+
+import optax
+import numpy as onp
 from einops import rearrange, reduce, repeat
-from .layers import convolve, normalise, Convolution, Projection, Embedding, Selformer
-from .toolkit import *
-from .dataloader import *
-from .models.lpips import LPIPS
+from layers import convolve, normalise, Activation, Convolution, Projection, Layernorm, Embedding, MLP, SelfAttention
+from toolkit import *
+from augmentations import *
+from models import LPIPS
+
+import torch
+import torchvision.transforms as T
+from dataloader import ImageDataset, dataloader
+
 
 import wandb
 import click
@@ -29,17 +35,18 @@ class Downsample(Module):
     filter:jnp.ndarray = static_field()
     stride:int = static_field()
 
-    def __init__(self, filter=[1.,3.,3.,1.], stride:int=2, key=None):
+    def __init__(self, filter=[1.,2.,1.], stride:int=2, key=None):
         filter = jnp.array(filter)
         filter = filter[:,None] * filter[None,:]
         self.filter = filter / filter.sum()
         self.stride = stride
 
     def __call__(self, x:Float[Array, "h w c"], key=None):
-        h, w, c, dtype = x.shape, x.dtype
-        depthwise = repeat(self.filter.astype(dtype), 'h w -> h w i o', i=1, o=c)
-        x = convolve(x, depthwise, stride=self.stride, padding="same", groups=c)
-
+        h, w, c = x.shape
+        depthwise = repeat(self.filter.astype(x.dtype), 'h w -> h w i o', i=1, o=c)
+        x = rearrange(x, 'h w c -> 1 h w c')
+        x = convolve(x, depthwise, stride=self.stride, padding=1, groups=c)
+        x = rearrange(x, '1 h w c -> h w c')
         return x
 
 
@@ -109,9 +116,7 @@ class VectorQuantiser(Module):
     def __init__(self, features:int, codes:int, pages:int, beta:float=0.25, bias=True, key=None):
         key = RNG(key)
 
-        weight = jr.normal(next(key), (pages, codes))
-        self.codebook = Embedding(pages, codes, weight=weight, key=next(key))
-
+        self.codebook = Embedding(pages, codes, key=next(key))
         self.input = Projection(features, codes, bias=bias, key=next(key))
         self.output = Projection(codes, features, bias=bias, key=next(key))
         self.pages = pages
@@ -121,7 +126,7 @@ class VectorQuantiser(Module):
         z, codes = normalise(self.input(z)), normalise(self.codebook.weight)
 
         distance = compute_euclidean_distance(z, codes)
-        idxes = jnp.argmin(distance)
+        idxes = distance.argmin(axis=-1)
         codes = normalise(self.codebook(idxes))
 
         loss = self.beta * jnp.mean((sg(z) - codes) ** 2) + \
@@ -132,34 +137,77 @@ class VectorQuantiser(Module):
 
         return codes, loss, idxes
 
+class Imageformer(Module):
+    attention:SelfAttention
+    mixer:Convolution
+    mlp:MLP
+    prenorm:Layernorm
+    postnorm:Layernorm
+    mixnorm:Layernorm
+    width:int
+    height:int
+
+    def __init__(self, features:int, heads:int, width:int, height:int, dropout:float=0, bias=True, key=None):
+        key = RNG(key)
+        self.width, self.height = width, height
+        self.prenorm, self.postnorm, self.mixnorm = Layernorm([features]), Layernorm([features]), Layernorm([features])
+        self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
+        self.mixer = Convolution(features, features, 3, padding=1, groups=features, bias=bias, key=next(key))
+        self.mlp = MLP(features, dropout=dropout, bias=bias, key=next(key))
+
+    def __call__(self, x:Float[Array, "n d"], key=None):
+        key = RNG(key)
+        x = self.attention(self.prenorm(x), key=next(key)) + x
+        x = self.mlp(self.postnorm(x), key=next(key)) + x
+        x = rearrange(x, "(h w) d -> h w d", h=self.height, w=self.width)
+        x = self.mixer(self.mixnorm(x)) + x
+        x = rearrange(x, "h w d -> (h w) d")
+
+        return x
+
 class ViTQuantiser(Module):
+    epe:jnp.ndarray
+    dpe:jnp.ndarray
     input:Convolution
     encoder:nn.Sequential
     quantiser:VectorQuantiser
     decoder:nn.Sequential
     output:Convolution
-    size:int = static_field()
-    patch:int = static_field()
+    size:int
+    patch:int
 
 
     def __init__(self, features:int=768, codes:int=16, pages:int=8192, heads:int=12, depth:int=12, patch:int=8, size:int=256, dropout:float=0, bias=True, key=None):
         key = RNG(key)
         self.size = size
         self.patch = patch
+
+        ntoken = size//patch
+        self.epe = jnp.zeros((ntoken ** 2, features))
+        self.dpe = jnp.zeros((ntoken ** 2, features))
+
+        # patchify
         self.input = Convolution(3, features, patch, stride=patch, bias=bias, key=next(key))
-        self.encoder = nn.Sequential([Selformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)])
+        # encoder
+        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
+        self.encoder = nn.Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
+        # quantiser
         self.quantiser = VectorQuantiser(features, codes, pages, bias=bias, key=next(key))
-        self.decoder = nn.Sequential([Selformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)])
-        self.output = Convolution(features, 3 * patch * patch, patch, stride=patch, bias=bias, key=next(key))
+        # decoder
+        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
+        self.decoder = nn.Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
+        # pixelshuffle
+        self.output = nn.Sequential([Layernorm([features]), Activation("tanh"), Convolution(features, 3 * patch * patch, 1, bias=bias, key=next(key))])
 
     @forward
     def __call__(self, x:Float[Array, "h w c"], key=None):
+        key = RNG(key)
         compression = self.size // self.patch
         x = rearrange(self.input(x), 'h w c -> (h w) c')
-        
-        x = self.encoder(x)
+
+        x = self.encoder(x + self.epe, key=next(key))
         codes, loss, idxes = self.quantiser(x)
-        x = self.decoder(codes)
+        x = self.decoder(codes + self.dpe, key=next(key))
 
         x = rearrange(x, '(h w) c -> h w c', h=compression, w=compression)
         x = rearrange(self.output(x), 'h w (hr wr c) -> (h hr) (w wr) c', hr=self.patch, wr=self.patch) 
@@ -170,42 +218,60 @@ class ViTQuantiser(Module):
 
 @click.command()
 @click.option("--dataset", type=Path)
-@click.option("--steps", default=100000, type=int)
-@click.option("--lr", type=float, default=3e-4)
-@click.option("--batch", default=16, type=int)
+@click.option("--steps", default=1000042, type=int)
+@click.option("--warmup", default=10000)
+@click.option("--lr", type=float, default=6e-7)
+@click.option("--batch", default=4, type=int)
 @click.option("--features", type=int, default=768)
 @click.option("--pages", type=int, default=8192)
 @click.option("--heads", type=int, default=8)
 @click.option("--depth", type=int, default=12)
 @click.option("--dropout", type=float, default=0)
-@click.option("--use-bias", type=bool, default=False)
-@click.option("--ftype", type=str, default="single")
+@click.option("--bias", type=bool, default=True)
+@click.option("--workers", type=int, default=4)
+@click.option("--seed", type=int, default=42)
+@click.option("--precision", type=str, default="single")
 def train(**config):
     wandb.init(project = "MASKGIT", config = config)
     folder = Path(f"VQGAN/autoencoding/{wandb.run.id}")
     folder.mkdir()
 
-    key = jr.PRNGKey(42)
+    key = jr.PRNGKey(config["seed"])
     key = RNG(key)
 
-    ftype = config.get("ftype")
+    precisions = { "single":jnp.float32, "half":jnp.bfloat16 }
+    ftype = precisions[config["precision"]]
+
     dataset = Path("dataset/megabooru")
-    dataset = ImageDataset(dataset, size=256)
-    loader = dataloader(dataset, config["batch"], num_workers=4)
+    augmentations = [
+        T.RandomApply([T.RandomResizedCrop((256,256), scale=(0.7,1.0))]), 
+        T.RandomHorizontalFlip(0.2), 
+        T.RandomAdjustSharpness(2,0.3), 
+        T.RandomAutocontrast(0.3)
+    ]
+
+    dataset = ImageDataset(dataset, augmentations=augmentations)
+    loader = dataloader(dataset, config["batch"], num_workers=config["workers"])
     
-    
-    lpips = LPIPS.load("weights/lpips.weights")
+    lpips = LPIPS.load()
+    augmentation = nn.Sequential([RandomBrightness(), RandomSaturation(), RandomContrast(), RandomAffine(), RandomCutout()])
+    augmentation = CoinFlip(augmentation)
+
     D = Discriminator(features=[128,256,512,512,512,512,512], bias=config["bias"], key=next(key))
-    G = ViTQuantiser(config["features"], heads=config["heads"], depth=config["depths"], dropout=config["dropout"], bias=config["bias"], key=next(key))
+    G = ViTQuantiser(config["features"], heads=config["heads"], depth=config["depth"], dropout=config["dropout"], bias=config["bias"], key=next(key))
     D, G, lpips = cast(ftype)(D), cast(ftype)(G), cast(ftype)(lpips)
 
-    Doptim, Goptim = optax.adamw(config["lr"], 0.9, 0.95), optax.adamw(config["lr"], 0.9, 0.95)
-    Dstates, Gstates = Doptim.init(parameterise(D)), Goptim.init(parameterise(G))
+    schedule = optax.warmup_cosine_decay_schedule(0, config["lr"], config["warmup"], config["steps"] - config["warmup"])
+    Doptim, Goptim = optax.adamw(schedule, 0.9, 0.99), optax.adamw(schedule, 0.9, 0.99)
+    Doptim, Goptim = optax.MultiSteps(Doptim, 1), optax.MultiSteps(Goptim, 1)
+    Dstates, Gstates = Doptim.init(parameters(D)), Goptim.init(parameters(G))
     D, G, Dstates, Gstates = replicate(D), replicate(G), replicate(Dstates), replicate(Gstates)
 
     @ddp
-    def Gstep(G, D, x, states, key=None):
+    def Gstep(model, x, states, key=None):
         key = RNG(key)
+        G,D = model
+
         @gradients
         def loss(G):
             r, codes, loss, idxes = G(x, key=next(key))
@@ -213,18 +279,20 @@ def train(**config):
             adversarial = jax.nn.softplus(-D(r))
             perceptual = lpips(x,r)
 
-            loss = loss.mean() + l2.mean() + .3 * perceptual.mean() + .3 * adversarial.mean() + l1.mean()
-            return loss, {}
+            loss = loss.mean() + l2.mean() + .25 * (perceptual ** 2).mean() + .25 * adversarial.mean()
+            return loss, { "l2":l2.mean(), "perceptual":perceptual.mean(), "adversarial":adversarial.mean() }
 
-        (l, metrics), gradients = loss(G)
-        updates, states = Goptim.update(gradients, states, G)
+        (l, metrics), g = loss(G)
+        updates, states = Goptim.update(g, states, G)
         G = equinox.apply_updates(G, updates)
 
         return G, states, l, metrics
 
     @ddp
-    def Dstep(G, D, x, states, augmentation, key=None):
+    def Dstep(model, x, states, augmentation=identity, key=None):
         key = RNG(key)
+        G,D = model
+
         @gradients
         def loss(D):
             fakes, codes, loss, idxes = G(x, key=next(key))
@@ -232,48 +300,65 @@ def train(**config):
             loss = jax.nn.softplus(fscores) + jax.nn.softplus(-rscores)
             return loss.mean(), {}
 
-        (l, metrics), gradients = loss(D)
-        updates, states = Doptim.update(gradients, states, D)
+        (l, metrics), g = loss(D)
+        updates, states = Doptim.update(g, states, D)
         D = equinox.apply_updates(D, updates)
 
         return D, states, l, metrics
 
 
     @ddp
-    def DRstep(G, D, x, states, interval:int=32, key=None):
+    def DRstep(model, x, states, interval:int=32, key=None):
+        G,D = model
+
         @gradients
         def loss(D):
-            y, pullback = jax.vjp(D, x)
-            (gradients,) = pullback(jnp.ones(y.shape, dtype=ftype))
-            gradients = reduce(gradients ** 2, 'b h w c -> b', 'sum')
-            loss = .5 * .1 * interval * (gradients.sqrt() - 1) ** 2
+            y, pullback = jax.vjp(D,x)
+            (g,) = pullback(jnp.ones(y.shape, dtype=ftype))
+            loss = 1000000 * interval * reduce(g ** 2, 'b h w c -> b', "sum")
             return loss.mean(), {}
 
-        (l, metrics), gradients = loss(D)
-        updates, states = Doptim.update(gradients, states, D)
+        (l, metrics), g = loss(D)
+        updates, states = Doptim.update(g, states, D)
         D = equinox.apply_updates(D, updates)
 
-        return D, states, l, metrics 
-
+        return D, states, l, metrics
 
     for idx in tqdm(range(config["steps"])):
         batch = cast(ftype)(next(loader))
-        G, Gstates, Gloss, metrics = Gstep(G, D, batch, Gstates, key=next(key))
-        D, Dstates, Dloss, metrics = Dstep(G, D, batch, Dstates, key=next(key))
-        
-        if idx % 32 == 0:
-            D, Dstates, DRloss, metrics = DRstep(G, D, batch, Dstates, interval=32, key=next(key))
+        every = lambda n : idx % n == 0
 
-        if idx % 4200 == 0:
-            ckpt = folder / idx
+        G, Gstates, Gloss, metrics = Gstep((G,D), batch, Gstates, key=next(key))
+        D, Dstates, Dloss, _ = Dstep((G,D), batch, Dstates, augmentation=augmentation, key=next(key))
+        if every(4): D, Dstates, DRloss, _ = DRstep((G,D), batch, Dstates, interval=4, key=next(key))
+
+        if every(10000):
+            ckpt = folder / str(idx)
             ckpt.mkdir()
 
             save(ckpt / "G.weight", unreplicate(G))
             save(ckpt / "D.weight", unreplicate(D))
             save(ckpt / "optimisers.ckpt", {"G":Goptim, "D":Doptim})
             save(ckpt / "states.ckpt", {"G":unreplicate(Gstates), "D":unreplicate(Dstates)})
+            
+        if every(2500):
+            N = 16
+            fakes, codes, loss, idxes = unreplicate(G)(batch[:N], key=next(key))
+            comparison = jnp.concatenate((batch[:N], fakes))
+            comparison = rearrange(comparison, '(b d) h w c -> (b h) (d w) c', d = 2)
+            dataset.tensor_to_image(comparison).save(folder / f"{idx}.png")
 
-        wandb.log({ "G":Gloss.mean(), "D":Dloss.mean(), "DR":DRloss.mean() })
+            print("reals", batch[:N].mean(), batch[:N].std())
+            print("fakes", fakes.mean(), fakes.std())
+
+        wandb.log({ 
+            "G":Gloss.mean().item(), 
+            "D":Dloss.mean().item(), 
+            "DR":DRloss.mean().item(),
+            "l2":metrics["l2"].mean().item(), 
+            "perceptual":metrics["perceptual"].mean().item(),
+            "adversarial":metrics["adversarial"].mean().item(),
+        })
 
     wandb.finish()
 

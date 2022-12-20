@@ -11,14 +11,15 @@ from toolkit import RNG
 from functools import partial
 
 pair = lambda t : (t,t)
-lecun = jax.nn.initializers.lecun_normal()
-xavier = jax.nn.initializers.xavier_normal()
+lecun = jax.nn.initializers.lecun_uniform()
+xavier = jax.nn.initializers.xavier_uniform()
 
 ACTS = { 
     "gelu":jax.nn.gelu, 
     "egelu":partial(jax.nn.gelu, approximate=False), 
     "agelu":lambda x : x * jax.nn.sigmoid(1.702 * x),
     "ngelu":lambda x : .5 * x * (1. + jax.lax.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 + x ** 3))),
+    "swish":jax.nn.silu,
     "tanh":jax.nn.tanh,
     "relu":jax.nn.relu 
 }
@@ -49,7 +50,7 @@ class Convolution(Module):
 
 
     def __init__(self, nin, non, kernel:int=3, stride:int=1, padding:int=0, groups:int=1, bias=True, key=None):
-        self.weight = lecun(key, (kernel, kernel, nin, non))
+        self.weight = lecun(key, (kernel, kernel, nin // groups, non))
         self.bias = jnp.zeros((non,)) if bias else None
         self.kernel, self.stride, self.padding, self.groups = kernel, stride, padding, groups
 
@@ -76,14 +77,15 @@ class Embedding(Module):
         self.weight = jr.normal(key, (pages, features))
 
     def __call__(self, idxes:IntArray):
-        return jax.nn.one_hot(idxes, self.pages) @ self.weight
+        idxes = jax.nn.one_hot(idxes, self.pages, dtype=self.weight.dtype)
+        return idxes @ self.weight
 
 class Projection(Module):
     weight:jnp.ndarray
     bias:jnp.ndarray
 
-    def __init__(self, nin, non, bias=True, scale=.02, key=None):
-        self.weight = jr.normal(key, (nin, non)) * scale
+    def __init__(self, nin, non, bias=True, key=None):
+        self.weight = lecun(key, (nin, non))
         self.bias = jnp.zeros((non,)) if bias else None
 
     def __call__(self, x:FloatArray, key=None):
@@ -125,7 +127,7 @@ class SelfAttention(Module):
 
         self.heads = heads
         self.features = features
-        self.scale = onp.sqrt(features // heads)
+        self.scale = math.sqrt(features // heads)
 
         self.query = Projection(features, features, bias=bias, key=next(key))
         self.key = Projection(features, features, bias=bias, key=next(key))
@@ -137,10 +139,9 @@ class SelfAttention(Module):
         akey, okey = jr.split(key)
         q,k,v = self.query(x), self.key(x), self.value(x)
         q,k,v = map(lambda x : rearrange(x, 'n (h d) -> h n d', h=self.heads), (q,k,v))
-
         k = rearrange(k, 'h n d -> h d n')
-        attention = q @ k / self.scale # [h m d] @ [h d n] = [h m n]
 
+        attention = q @ k / self.scale # [h m d] @ [h d n] = [h m n]
         attention = self.dropout(jax.nn.softmax(attention), key=akey)
 
         outputs = rearrange(attention @ v, 'h n d -> n (h d)')
@@ -163,7 +164,7 @@ class CrossAttention(Module):
 
         self.heads = heads
         self.features = features
-        self.scale = onp.sqrt(features // heads)
+        self.scale = math.sqrt(features // heads)
 
         self.query = Projection(features, features, bias=bias, key=next(key))
         self.key = Projection(context, features, bias=bias, key=next(key))
