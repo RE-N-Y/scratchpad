@@ -257,13 +257,7 @@ def train(**cfg):
     augmentation = CoinFlip(augmentation)
 
     grads = partial(gradients, precision=cfg["precision"])
-    D = Discriminator(features=[128,256,512,512,512,512,512], bias=cfg["bias"], key=next(key))
     G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
-
-    Doptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], 6e-7)
-    Doptim = optax.adabelief(Doptim)
-    Dstates = Doptim.init(parameters(D))
-    D, Dstates = replicate(D), replicate(Dstates)
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], 6e-7)
     Goptim = optax.adabelief(Goptim)
@@ -271,70 +265,30 @@ def train(**cfg):
     G, Gstates = replicate(G), replicate(Gstates)
 
     @ddp
-    def Gstep(model, reals, states, key=None):
+    def Gstep(G, reals, states, key=None):
         key = RNG(key)
-        G,D = model
 
         @grads
-        def loss(G, D, lpips, reals):
+        def loss(G, lpips, reals):
             fakes, codes, loss, idxes = G(reals, jr.split(next(key), len(reals)))
             l2, l1 = jnp.square(reals - fakes), jnp.abs(reals - fakes)
             perceptual = lpips(reals, fakes)
-            adversarial = jax.nn.softplus(-D(augmentation(fakes, jr.split(next(key), len(fakes)))))
 
-            l = loss.mean() + l2.mean() + .1 * perceptual.mean() + .1 * adversarial.mean()
+            l = loss.mean() + l2.mean() + .1 * perceptual.mean()
 
-            return l, { "loss":loss.mean(), "l2":l2.mean(), "perceptual":perceptual.mean(), "adversarial":adversarial.mean() }
+            return l, { "loss":loss.mean(), "l2":l2.mean(), "perceptual":perceptual.mean() }
 
-        (l, metrics), g = loss(G, D, lpips, reals)
+        (l, metrics), g = loss(G, lpips, reals)
         updates, states = Goptim.update(g, states, G)
         G = equinox.apply_updates(G, updates)
 
         return G, states, l, metrics
 
-    @ddp
-    def Dstep(model, reals, states, augmentation, key=None):
-        key = RNG(key)
-        G,D = model
-
-        @grads
-        def loss(D, G, reals):
-            fakes, loss, distance, idxes = G(reals, jr.split(next(key), len(reals)))
-            fscores = D(augmentation(fakes, jr.split(next(key), len(fakes))))
-            rscores = D(augmentation(reals, jr.split(next(key), len(reals))))
-            loss = jax.nn.softplus(fscores) + jax.nn.softplus(-rscores)
-            return loss.mean(), {}
-
-        (l, metrics), g = loss(D, G, reals)
-        updates, states = Doptim.update(g, states, D)
-        D = equinox.apply_updates(D, updates)
-
-        return D, states, l, metrics
-
-    @ddp
-    def DRstep(model, reals, states, interval:int=4, key=None):
-        G,D = model
-
-        @grads
-        def loss(D, reals):
-            y, pullback = jax.vjp(D, reals)
-            (g,) = pullback(jnp.ones(y.shape, dtype=y.dtype))
-            loss = 10000 * interval * reduce(g ** 2, 'b h w c -> b', "sum")
-            return loss.mean(), {}
-
-        (l, metrics), g = loss(D, reals)
-        updates, states = Doptim.update(g, states, D)
-        D = equinox.apply_updates(D, updates)
-
-        return D, states, l, metrics
-
     for idx in tqdm(range(cfg["steps"])):
         batch = next(loader)
         batch = rearrange(batch["images"], "... c h w -> ... h w c")
 
-        G, Gstates, Gloss, metrics = Gstep((G,D), batch, Gstates, dsplit(next(key)))
-        D, Dstates, Dloss, _ = Dstep((G,D), batch, Dstates, augmentation, dsplit(next(key)))
-        if idx % 16 == 0: D, Dstates, DRloss, _ = DRstep((G,D), batch, Dstates, 4, dsplit(next(key)))
+        G, Gstates, Gloss, metrics = Gstep(G, batch, Gstates, dsplit(next(key)))
 
         if idx % 16384 == 0:
             ckpt = folder / str(idx)
@@ -350,11 +304,9 @@ def train(**cfg):
 
         wandb.log({
             "G":Gloss.mean().item(),
-            "D":Dloss.mean().item(),
             "l2":metrics["l2"].mean().item(),
             "loss":metrics["loss"].mean().item(),
             "perceptual":metrics["perceptual"].mean().item(),
-            "adversarial":metrics["adversarial"].mean().item(),
         })
 
     wandb.finish()
