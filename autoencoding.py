@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from jaxtyping import Float, Integer, Array
 
 import optax
 import numpy as onp
@@ -8,8 +9,8 @@ import equinox
 from equinox import nn, static_field, Module
 from equinox.serialisation import tree_serialise_leaves as save
 from equinox.serialisation import tree_deserialise_leaves as load
-from einops import rearrange, reduce, repeat
-from .layers import Convolution, Layernorm, MLP, SelfAttention
+from einops import rearrange, reduce, repeat, pack
+from .layers import Convolution, Layernorm, MLP, CrossAttention
 from .toolkit import *
 from .dataloader import *
 
@@ -57,7 +58,7 @@ class Downsample(Module):
 class UNet(Module):
     input:Convolution
     encoder:list
-    attention:SelfAttention
+    bridge:list
     decoder:list
     output:Convolution
 
@@ -65,36 +66,35 @@ class UNet(Module):
         key = RNG(key)
         [first, *_, last] = features
         ninnon = list(zip(features[:-1], features[1:]))
-
-        # TODO: add concatenation connection
-        # TODO: use blocks argument
         
-        down = lambda nin, non : (
-            Resnet(nin, bias=bias, key=next(key)),
-            Resnet(nin, bias=bias, key=next(key)),
-            Resnet(nin, bias=bias, key=next(key)),
-            Downsample(nin, non, bias=bias, key=next(key))
+        down = lambda nin, non : nn.Sequential(
+            [Resnet(nin, bias=bias, key=next(key)) for _ in range(blocks)] + \
+            [Downsample(nin, non, bias=bias, key=next(key))]
         )
 
-        up = lambda nin, non : (
-            Upsample(non, nin, bias=bias, key=next(key)),
-            Resnet(nin, bias=bias, key=next(key)),
-            Resnet(nin, bias=bias, key=next(key)),
-            Resnet(nin, bias=bias, key=next(key)),
+        up = lambda nin, non : nn.Sequential(
+            [Resnet(non+non, bias=bias, key=next(key)) for _ in range(blocks)] + \
+            [Upsample(non+non, nin, bias=bias, key=next(key))]
         )
 
         self.input = Convolution(vocab, first, kernel=3, padding=1, bias=bias, key=next(key))
         self.encoder = [down(nin,non) for nin,non in ninnon]
-        self.attention = SelfAttention(features=last, heads=heads, bias=bias, key=next(key))
-        self.decoder = [up(nin,non) for nin,non in ninnon]
+        self.bridge = CrossAttention(features=last, context=last, heads=heads, bias=bias, key=next(key))
+        self.decoder = [up(nin,non) for nin,non in ninnon] # reverse
         self.output = Convolution(first, vocab, kernel=3, padding=1, bias=bias, key=next(key))
 
     @forward
-    def __call__(self, x, key=None):
-        x = self.input(x)
-        for layer, down in self.encoder: x = down(layer(x))
-        x = self.attention(x)
-        for up, layer in self.decoder: x = layer(up(x))
+    def __call__(self, x, masks, key=None):
+        x, hiddens = self.input(x), []
+
+        for idx, layer in enumerate(self.encoder): 
+            hiddens.append(x := layer(x))
+
+        x = self.attention(x,x)
+        
+        for idx, layer in enumerate(self.decoder):
+            x, _ = pack([layer(x),hiddens[idx]], 'h w *')
+
         x = self.output(x)
 
         return x
@@ -111,14 +111,11 @@ from PIL import Image
 def sample(ratio): return jnp.cos(.5 * jnp.pi * ratio)
 
 @batch
-def create_sequence_masks(idxes, key=None):
+def create_tensor_masks(idxes, key=None):
     key = RNG(key)
     ratio = sample(jr.uniform(next(key)))
     masks = jr.uniform(next(key), idxes.shape)
     masks = jnp.where(masks > ratio, 1, 0) # 1 = NO MASK, 0 = MASK
-
-    ridx = jr.choice(next(key), len(idxes))
-    masks = masks.at[ridx].set(0)
 
     return masks
 
@@ -138,8 +135,8 @@ def create_sequence_masks(idxes, key=None):
 @click.option("--dropout", type=float, default=0)
 @click.option("--length", type=int, default=1024)
 @click.option("--label-smoothing", type=float, default=0.1)
-def train(**config):
-    wandb.init(project = "MASKGIT", config = config)
+def train(**cfg):
+    wandb.init(project = "MASKGIT", config = cfg)
     folder = Path(f"VQGAN/autoencoding/{wandb.run.id}")
     folder.mkdir()
 
@@ -148,41 +145,40 @@ def train(**config):
 
     dataset = Path("dataset/megabooru")
     dataset = ImageDataset(dataset, size=256)
-    loader = dataloader(dataset, config["minibatch"], num_workers=4)
+    loader = dataloader(dataset, cfg["batch"], num_workers=4)
     loader = cycle(loader)
 
-    ministep = config["batch"] // config["minibatch"]
-    params, apply = parameterise(T)
+    grads = partial(gradients, precision=cfg["precision"])
+    G, states = replicate(G), replicate(states)
 
-    optimisers = optax.lamb(config["lr"], 0.9, 0.96)
-    optimisers = optax.MultiSteps(optimisers, ministep)
-    states = optimisers.init(params)
-    params, states = replicate(params), replicate(states)
+    optimisers = optax.adam(cfg["lr"], 0.9, 0.96)
+    states = optimisers.init(G)
 
     @ddp
-    def Gstep(params, batch, states, key=None):
+    def Gstep(G, batch, masks, states, key=None):
         key = RNG(key)
 
-        @gradients
-        def cross_entropy_loss(params):
-            out = apply(params, batch, key=next(key))
-            loss = out - batch
+        @grads
+        def cross_entropy_loss(G, batch, masks):
+            logits = G(batch, key=next(key))
+            labels = jax.nn.one_hot(batch, cfg["vocab"])
+            labels = optax.smooth_labels(labels, cfg["label_smoothing"])
+            loss = optax.softmax_cross_entropy(logits, labels)
             return loss.mean(), { }
 
-        (loss, metrics), gradients = cross_entropy_loss(params)
-        updates, states = optimisers.update(gradients, states, params)
-        params = equinox.apply_updates(params, updates)
+        (loss, metrics), gradients = cross_entropy_loss(G, batch)
+        updates, states = optimisers.update(gradients, states, G)
+        G = equinox.apply_updates(G, updates)
 
-        return params, states, loss, metrics
+        return G, states, loss, metrics
 
 
-    for idx in tqdm(range(config["total_steps"])):
-        for _ in tqdm(range(ministep)):
-            batch = jnp.array(next(loader))
-            params, states, Gloss, metrics = Gstep(params, batch, states, key=next(key))
+    for idx in tqdm(range(cfg["total_steps"])):
+        batch = next(loader)
+        G, states, Gloss, metrics = Gstep(G, batch, masks, states, key=next(key))
 
         if idx % 16 == 0:
-            checkpoint = { "T":unreplicate(params), "states":unreplicate(states), "optimisers":optimisers }
+            checkpoint = { "T":unreplicate(G), "states":unreplicate(states), "optimisers":optimisers }
             save(folder / f"{idx}.nox", checkpoint)
 
         wandb.log({ "loss":onp.mean(Gloss) })

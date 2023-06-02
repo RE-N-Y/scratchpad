@@ -2,9 +2,9 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox
-from equinox import nn, static_field, Module
+from equinox import nn, static_field as buffer, Module
 from einops import rearrange, reduce, repeat
-from layers import Activation, Convolution, Maxpool, normalise
+from layers import Activation, Convolution, Maxpool
 from toolkit import RNG, forward
 import gdown
 from pathlib import Path
@@ -45,9 +45,9 @@ class VGGFeatures(Module):
 class LPIPS(Module):
     backbone:Module
     linears:list
-    slices:list = static_field()
-    mean:jnp.ndarray = static_field()
-    std:jnp.ndarray = static_field()
+    slices:list = buffer()
+    mean:jnp.ndarray = buffer()
+    std:jnp.ndarray = buffer()
 
     def __init__(self, slices = [3, 8, 15, 22, 29], features = [64, 128, 256, 512, 512], key=None):
         key = RNG(key)
@@ -64,10 +64,13 @@ class LPIPS(Module):
         model = equinox.tree_deserialise_leaves(file, cls(key=key))
 
         return model
+    
+    def normalise(self, x, axis=-1, eps=1e-10):
+        r = jnp.sqrt(jnp.sum(x ** 2, axis=axis, keepdims=True)) + eps
+        return x / r
 
     @forward
     def __call__(self, x, y, key=None):
-        eps = 1e-10
         features = {}
         difference = 0.
 
@@ -79,7 +82,7 @@ class LPIPS(Module):
         _, features['y'] = self.backbone(y, self.slices)
 
         for idx, (x, y) in enumerate(zip(features['x'], features['y'])):
-            d = normalise(x, eps=eps) - normalise(y, eps=eps)
+            d = self.normalise(x) - self.normalise(y)
             d = reduce(self.linears[idx](d ** 2), 'h w c -> 1 1 c', 'mean')
             difference += d
 

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
 import numpy as onp
-from equinox import nn, static_field, Module
+from equinox import nn, static_field as buffer, Module
 from einops import rearrange, reduce, repeat
 from toolkit import RNG, forward
 
@@ -72,7 +72,7 @@ def identity(x, *_, **__): return x
 
 class CoinFlip(Module):
     augment : Module
-    p : float = static_field()
+    p : float = buffer()
 
     def __init__(self, augment, p=0.5):
         self.augment = augment
