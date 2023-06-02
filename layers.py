@@ -19,6 +19,7 @@ ACTS = {
     "gelu":jax.nn.gelu, 
     "egelu":partial(jax.nn.gelu, approximate=False), 
     "agelu":lambda x : x * jax.nn.sigmoid(1.702 * x),
+    "ngelu":lambda x : .5 * x * (1. + jax.lax.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 + x ** 3))),
     "swish":jax.nn.silu,
     "tanh":jax.nn.tanh,
     "relu":jax.nn.relu 
