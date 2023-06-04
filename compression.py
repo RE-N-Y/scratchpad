@@ -213,6 +213,7 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
 @click.option("--dataset", type=Path)
 @click.option("--steps", default=1000042, type=int)
 @click.option("--warmup", default=4096, type=int)
+@click.option("--cooldown", default=0, type=float)
 @click.option("--lr", type=float, default=5e-6)
 @click.option("--batch", default=64, type=int)
 @click.option("--size", default=256, type=int)
@@ -260,12 +261,12 @@ def train(**cfg):
     D = Discriminator(features=[128,256,512,512,512,512,512], bias=cfg["bias"], key=next(key))
     G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
 
-    Doptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], 6e-7)
+    Doptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Doptim = optax.adabelief(Doptim)
     Dstates = Doptim.init(parameters(D))
     D, Dstates = replicate(D), replicate(Dstates)
 
-    Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], 6e-7)
+    Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.adabelief(Goptim)
     Gstates = Goptim.init(parameters(G))
     G, Gstates = replicate(G), replicate(Gstates)
