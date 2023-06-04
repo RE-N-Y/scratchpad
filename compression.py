@@ -9,7 +9,7 @@ from equinox import static_field as buffer, Module
 import optax
 import numpy as onp
 from einops import rearrange, reduce, repeat, einsum, pack
-from layers import convolve, normalise, Sequential, Convolution, Projection, Layernorm, Embedding, MLP, SelfAttention
+from layers import convolve, normalise, Sequential, Convolution, Projection, Layernorm, Embedding, MLP, ParallelAttention
 from toolkit import *
 from augmentations import *
 from models import LPIPS
@@ -133,25 +133,24 @@ class VectorQuantiser(Module):
         return codes, loss, idxes
 
 class Imageformer(Module):
-    attention:SelfAttention
+    attention:ParallelAttention
     mlp:MLP
     prenorm:Layernorm
-    postnorm:Layernorm
     width:int
     height:int
 
-    def __init__(self, features:int, heads:int, width:int, height:int, dropout:float=0, bias=True, key=None):
+    def __init__(self, features:int, heads:int, width:int, height:int, dropout:float=0, key=None):
         key = RNG(key)
         self.width, self.height = width, height
-        self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
-        self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
-        self.mlp = MLP(features, dropout=dropout, bias=bias, key=next(key))
+        self.prenorm = Layernorm([features])
+        self.attention = ParallelAttention(features, heads=heads, dropout=dropout, key=next(key))
+        self.mlp = MLP(features, dropout=dropout, bias=True, key=next(key))
 
     def __call__(self, x:Float[Array, "n d"], key=None):
         key = RNG(key)
-        x = self.attention(self.prenorm(x), key=next(key)) + x
-        x = self.mlp(self.postnorm(x), key=next(key)) + x
-
+        x = self.prenorm(x)
+        x = x + self.attention(x, key=next(key)) + self.mlp(x, key=next(key))
+        
         return x
 
 class VQVAE(Module):
@@ -178,12 +177,12 @@ class VQVAE(Module):
         # patchify
         self.input = Convolution(3, features, patch, stride=patch, bias=bias, key=next(key))
         # encoder
-        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
+        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
         self.encoder = Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
         # quantiser
         self.quantiser = VectorQuantiser(features, codes, pages, bias=bias, key=next(key))
         # decoder
-        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
+        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
         self.decoder = Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
         # pixelshuffle
         self.output = Convolution(features, 3 * patch * patch, 1, bias=bias, key=next(key))
@@ -214,7 +213,7 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
 @click.option("--steps", default=1000042, type=int)
 @click.option("--warmup", default=4096, type=int)
 @click.option("--lr", type=float, default=5e-6)
-@click.option("--cooldown", type=int, default=6e-7)
+@click.option("--cooldown", type=float, default=6e-7)
 @click.option("--batch", default=64, type=int)
 @click.option("--size", default=256, type=int)
 @click.option("--patch", type=int, default=8)

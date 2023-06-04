@@ -197,6 +197,51 @@ class SelfAttention(Module):
 
         return outputs
 
+
+class ParallelAttention(Module):
+    query:Projection
+    key:Projection
+    value:Projection
+    out:Projection
+    qnorm:Layernorm
+    knorm:Layernorm
+    dropout:nn.Dropout
+    causal:bool = buffer()
+    heads:int = buffer()
+    features:int = buffer()
+    scale:float = buffer()
+
+    def __init__(self, features:int, heads:int=12, dropout:float=0, causal=False, key=None):
+        key = RNG(key)
+
+        self.heads = heads
+        self.features = features
+        self.scale = math.sqrt(features // heads)
+        self.causal = causal
+
+        self.query = Projection(features, features, bias=False, key=next(key))
+        self.qnorm = Layernorm([features])
+        self.key = Projection(features, features, bias=False, key=next(key))
+        self.knorm = Layernorm([features])
+        self.value = Projection(features, features, bias=False, key=next(key))
+        self.out = Projection(features, features, bias=True, key=next(key))
+        self.dropout = nn.Dropout(dropout)
+        
+
+    def __call__(self, x:Float[Array, "n d"], key=None):
+        akey, okey = jr.split(key)
+        q,k,v = self.qnorm(self.query(x)), self.knorm(self.key(x)), self.value(x)
+        q,k,v = map(lambda x : rearrange(x, 'n (h d) -> h n d', h=self.heads), (q,k,v))
+        k = rearrange(k, 'h n d -> h d n')
+
+        attention = q @ k / self.scale # [h m d] @ [h d n] = [h m n]
+        attention = self.dropout(jax.nn.softmax(attention), key=akey)
+
+        outputs = rearrange(attention @ v, 'h n d -> n (h d)')
+        outputs = self.dropout(self.out(outputs), key=okey)
+
+        return outputs
+
 class CrossAttention(Module):
     query:Projection
     key:Projection
