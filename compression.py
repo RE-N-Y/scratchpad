@@ -136,10 +136,11 @@ class Imageformer(Module):
     attention:SelfAttention
     mlp:GLU
     prenorm:Layernorm
+    postnorm:Layernorm
     width:int
     height:int
 
-    def __init__(self, features:int, heads:int, width:int, height:int, dropout:float=0, key=None):
+    def __init__(self, features:int, heads:int, width:int, height:int, bias=False, dropout:float=0, key=None):
         key = RNG(key)
         self.width, self.height = width, height
         self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
@@ -212,8 +213,8 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
 @click.option("--dataset", type=Path)
 @click.option("--steps", default=1000042, type=int)
 @click.option("--warmup", default=4096, type=int)
-@click.option("--lr", type=float, default=5e-6)
-@click.option("--cooldown", type=float, default=6e-7)
+@click.option("--lr", type=float, default=1e-5)
+@click.option("--cooldown", type=float, default=1e-6)
 @click.option("--batch", default=64, type=int)
 @click.option("--size", default=256, type=int)
 @click.option("--patch", type=int, default=8)
@@ -260,7 +261,7 @@ def train(**cfg):
     G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
-    Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=1e-3)
+    Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=3e-4)
     Gstates = Goptim.init(parameters(G))
     G, Gstates = replicate(G), replicate(Gstates)
 

@@ -1,0 +1,71 @@
+wandb: Currently logged in as: nyre. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.15.3
+wandb: Run data is saved locally in /home/sangwulee/scratchpad/wandb/run-20230604_150951-o7yizuo2
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run autumn-tree-134
+wandb: ⭐️ View project at https://wandb.ai/nyre/VQGAN
+wandb: 🚀 View run at https://wandb.ai/nyre/VQGAN/runs/o7yizuo2
+/ - \ | / - \ | / - \ | / - \ | / - \ | / - \ | / -This dataset can be visualized in Jupyter Notebook by ds.visualize() or at https://app.activeloop.ai/reny/animefaces
+
+  \ | / - \ | / - \ | / - \ | / - \ | / - \ | / - \ | / - \ | / - \hub://reny/animefaces loaded successfully.
+
+  Traceback (most recent call last):
+  File "compression.py", line 313, in <module>
+    train()
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 1130, in __call__
+    return self.main(*args, **kwargs)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 1055, in main
+    rv = self.invoke(ctx)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 1404, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 760, in invoke
+    return __callback(*args, **kwargs)
+  File "compression.py", line 261, in train
+    G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_module.py", line 128, in __call__
+    self = super(_ModuleMeta, initable_cls).__call__(*args, **kwargs)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_better_abstract.py", line 219, in __call__
+    self = super().__call__(*args, **kwargs)
+  File "compression.py", line 181, in __init__
+    transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
+  File "compression.py", line 181, in <listcomp>
+    transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_module.py", line 128, in __call__
+    self = super(_ModuleMeta, initable_cls).__call__(*args, **kwargs)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_better_abstract.py", line 219, in __call__
+    self = super().__call__(*args, **kwargs)
+  File "compression.py", line 147, in __init__
+    self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
+NameError: name 'bias' is not defined
+Traceback (most recent call last):
+  File "compression.py", line 313, in <module>
+    train()
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 1130, in __call__
+    return self.main(*args, **kwargs)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 1055, in main
+    rv = self.invoke(ctx)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 1404, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/click/core.py", line 760, in invoke
+    return __callback(*args, **kwargs)
+  File "compression.py", line 261, in train
+    G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_module.py", line 128, in __call__
+    self = super(_ModuleMeta, initable_cls).__call__(*args, **kwargs)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_better_abstract.py", line 219, in __call__
+    self = super().__call__(*args, **kwargs)
+  File "compression.py", line 181, in __init__
+    transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
+  File "compression.py", line 181, in <listcomp>
+    transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_module.py", line 128, in __call__
+    self = super(_ModuleMeta, initable_cls).__call__(*args, **kwargs)
+  File "/home/sangwulee/tpu/lib/python3.8/site-packages/equinox/_better_abstract.py", line 219, in __call__
+    self = super().__call__(*args, **kwargs)
+  File "compression.py", line 147, in __init__
+    self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
+NameError: name 'bias' is not defined
+wandb: Waiting for W&B process to finish... (failed 1). Press Control-C to abort syncing.
+wandb: - 0.022 MB of 0.022 MB uploaded (0.000 MB deduped)wandb: \ 0.022 MB of 0.022 MB uploaded (0.000 MB deduped)wandb: | 0.022 MB of 0.022 MB uploaded (0.000 MB deduped)wandb: / 0.022 MB of 0.022 MB uploaded (0.000 MB deduped)wandb: 🚀 View run autumn-tree-134 at: https://wandb.ai/nyre/VQGAN/runs/o7yizuo2
+wandb: Synced 6 W&B file(s), 0 media file(s), 3 artifact file(s) and 1 other file(s)
+wandb: Find logs at: ./wandb/run-20230604_150951-o7yizuo2/logs
