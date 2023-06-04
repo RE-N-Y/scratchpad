@@ -149,8 +149,8 @@ class Imageformer(Module):
 
     def __call__(self, x:Float[Array, "n d"], key=None):
         key = RNG(key)
-        x = self.prenorm(x)
-        x = x + self.attention(x, key=next(key)) + self.mlp(x, key=next(key))
+        x = self.attention(self.prenorm(x), key=next(key)) + x
+        x = self.mlp(self.postnorm(x), key=next(key)) + x
         
         return x
 
