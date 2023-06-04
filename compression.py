@@ -9,7 +9,7 @@ from equinox import static_field as buffer, Module
 import optax
 import numpy as onp
 from einops import rearrange, reduce, repeat, einsum, pack
-from layers import convolve, normalise, Sequential, Convolution, Projection, Layernorm, Embedding, MLP, ParallelAttention
+from layers import convolve, normalise, Sequential, Convolution, Projection, Layernorm, Embedding, MLP, GLU, SelfAttention
 from toolkit import *
 from augmentations import *
 from models import LPIPS
@@ -133,8 +133,8 @@ class VectorQuantiser(Module):
         return codes, loss, idxes
 
 class Imageformer(Module):
-    attention:ParallelAttention
-    mlp:MLP
+    attention:SelfAttention
+    mlp:GLU
     prenorm:Layernorm
     width:int
     height:int
@@ -142,9 +142,9 @@ class Imageformer(Module):
     def __init__(self, features:int, heads:int, width:int, height:int, dropout:float=0, key=None):
         key = RNG(key)
         self.width, self.height = width, height
-        self.prenorm = Layernorm([features])
-        self.attention = ParallelAttention(features, heads=heads, dropout=dropout, key=next(key))
-        self.mlp = MLP(features, dropout=dropout, bias=True, key=next(key))
+        self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
+        self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
+        self.mlp = GLU(features, dropout=dropout, bias=bias, key=next(key))
 
     def __call__(self, x:Float[Array, "n d"], key=None):
         key = RNG(key)
@@ -249,7 +249,7 @@ def train(**cfg):
         transform={"images":transform},
         decode_method={"images":"numpy"},
         num_workers=cfg["workers"],
-        shuffle=True
+        shuffle=False
     )
 
     lpips = LPIPS.load()
@@ -291,11 +291,8 @@ def train(**cfg):
         G, Gstates, Gloss, metrics = Gstep(G, batch, Gstates, dsplit(next(key)))
 
         if idx % 16384 == 0:
-            ckpt = folder / str(idx)
-            ckpt.mkdir()
-
-            save(ckpt / "G.weight", unreplicate(G))
-            save(ckpt / "states.ckpt", unreplicate(Gstates))
+            save(folder / "G.weight", unreplicate(G))
+            save(folder / "states.ckpt", unreplicate(Gstates))
 
         if idx % 2048 == 0:
             reals = batch[:32]

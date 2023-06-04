@@ -301,6 +301,31 @@ class MLP(Module):
         x = self.dropout(self.output(x), key = okey)
 
         return x
+    
+
+class GLU(Module):
+    input:Projection
+    output:Projection
+    gating:Projection
+    dropout:nn.Dropout
+    activation:str = buffer()
+
+    def __init__(self, features:int, activation:str="swish", dropout:float=0, bias=False, key=None):
+        key = RNG(key)
+
+        self.input = Projection(features, 4 * features, bias=bias, key=next(key))
+        self.output = Projection(4 * features, features, bias=bias, key=next(key))
+        self.gating = Projection(features, 4 * features, bias=bias, key=next(key))
+        self.dropout = nn.Dropout(dropout)
+        self.activation = Activation(activation)
+
+    def __call__(self, x:Float[Array, "n d"], key=None):
+        ikey, okey = jr.split(key)
+
+        x = self.dropout(self.activation(self.gating(x)), key = ikey) * self.input(x)
+        x = self.dropout(self.output(x), key = okey)
+
+        return x
 
 
 class FocalModulation(Module):
