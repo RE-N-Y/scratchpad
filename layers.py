@@ -6,7 +6,8 @@ from jaxtyping import Array, Float, Integer
 import math
 import numpy as onp
 from einops import rearrange, repeat, reduce, unpack
-from equinox import nn, static_field as buffer, Module
+from equinox import static_field as buffer, Module
+from equinox.nn import Dropout
 from toolkit import RNG
 from functools import partial
 
@@ -153,7 +154,7 @@ class SelfAttention(Module):
     key:Projection
     value:Projection
     out:Projection
-    dropout:nn.Dropout
+    dropout:Dropout
     causal:bool = buffer()
     heads:int = buffer()
     features:int = buffer()
@@ -171,7 +172,7 @@ class SelfAttention(Module):
         self.key = Projection(features, features, bias=bias, key=next(key))
         self.value = Projection(features, features, bias=bias, key=next(key))
         self.out = Projection(features, features, bias=bias, key=next(key))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = Dropout(dropout)
         
 
     def mask(self, attention):
@@ -202,7 +203,7 @@ class CrossAttention(Module):
     key:Projection
     value:Projection
     out:Projection
-    dropout:nn.Dropout
+    dropout:Dropout
     heads:int = buffer()
     features:int = buffer()
     scale:float = buffer()
@@ -218,7 +219,7 @@ class CrossAttention(Module):
         self.key = Projection(context, features, bias=bias, key=next(key))
         self.value = Projection(context, features, bias=bias, key=next(key))
         self.out = Projection(features, features, bias=bias, key=next(key))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = Dropout(dropout)
 
     def __call__(self, x:Float[Array, "n d"], ctx:Float[Array, "m c"], key=None):
         akey, okey = jr.split(key)
@@ -237,7 +238,7 @@ class CrossAttention(Module):
 class MLP(Module):
     input:Projection
     output:Projection
-    dropout:nn.Dropout
+    dropout:Dropout
     activation:str = buffer()
 
     def __init__(self, features:int, activation:str="gelu", dropout:float=0, bias=True, key=None):
@@ -245,7 +246,7 @@ class MLP(Module):
 
         self.input = Projection(features, 4 * features, bias=bias, key=next(key))
         self.output = Projection(4 * features, features, bias=bias, key=next(key))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = Dropout(dropout)
         self.activation = Activation(activation)
 
     def __call__(self, x:Float[Array, "n d"], key=None):
@@ -263,7 +264,7 @@ class FocalModulation(Module):
     h:Convolution
     layers:list
     projection:Projection
-    dropout:nn.Dropout
+    dropout:Dropout
     level:int = buffer()
     kernels:list = buffer()
     
@@ -278,7 +279,7 @@ class FocalModulation(Module):
         self.kernels = [factor * k + window for k in range(level)]
         self.layers = [ Convolution(features, features, kernel, padding=kernel//2, groups=features, bias=False, key=next(key)) for kernel in self.kernels]
         self.projection = Projection(features, features, bias=bias, key=next(key))
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = Dropout(dropout)
         
     def __call__(self, x, key=None):
         h, w, c = x.shape
@@ -296,6 +297,7 @@ class FocalModulation(Module):
         out = self.dropout(self.projection(out), key=key)
         
         return out
+
     
 class Selformer(Module):
     attention:SelfAttention
