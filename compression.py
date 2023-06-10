@@ -226,6 +226,7 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
 @click.option("--bias", type=bool, default=False)
 @click.option("--workers", type=int, default=16)
 @click.option("--seed", type=int, default=42)
+@click.option("--checkpoint", type=Path, default=None)
 @click.option("--precision", type=str, default="half")
 def train(**cfg):
     wandb.init(project = "VQGAN", config = cfg)
@@ -264,6 +265,12 @@ def train(**cfg):
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=0.1)
     Gstates = Goptim.init(parameters(G))
+
+    if cfg["checkpoint"] is not None:
+        G = load(cfg["checkpoint"] / "G.weight", G)
+        Gstates = load(cfg["checkpoint"] / "states.ckpt", Gstates)
+
+
     G, Gstates = replicate(G), replicate(Gstates)
 
     @ddp
