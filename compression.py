@@ -260,7 +260,7 @@ def train(**cfg):
     augmentation = CoinFlip(augmentation)
 
     grads = partial(gradients, precision=cfg["precision"])
-    G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
+    G = VQVAE(cfg["features"], pages=cfg["pages"], patch=cfg["patch"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=0.1)
