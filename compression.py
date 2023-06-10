@@ -250,7 +250,8 @@ def train(**cfg):
         transform={"images":transform},
         decode_method={"images":"numpy"},
         num_workers=cfg["workers"],
-        shuffle=False
+        buffer_size=8192,
+        shuffle=True
     )
 
     lpips = LPIPS.load()
@@ -261,7 +262,7 @@ def train(**cfg):
     G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
-    Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=3e-4)
+    Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=0.1)
     Gstates = Goptim.init(parameters(G))
     G, Gstates = replicate(G), replicate(Gstates)
 
@@ -291,7 +292,7 @@ def train(**cfg):
 
         G, Gstates, Gloss, metrics = Gstep(G, batch, Gstates, dsplit(next(key)))
 
-        if idx % 16384 == 0:
+        if idx % 8192 == 0:
             save(folder / "G.weight", unreplicate(G))
             save(folder / "states.ckpt", unreplicate(Gstates))
 

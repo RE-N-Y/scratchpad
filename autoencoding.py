@@ -10,92 +10,87 @@ from equinox import nn, static_field, Module
 from equinox.serialisation import tree_serialise_leaves as save
 from equinox.serialisation import tree_deserialise_leaves as load
 from einops import rearrange, reduce, repeat, pack
-from .layers import Convolution, Layernorm, MLP, CrossAttention
+from .layers import (
+    Convolution,
+    Layernorm,
+    Projection,
+    MLP,
+    GLU,
+    SelfAttention,
+    Sequential,
+    SinusodialEmbedding,
+    Embedding,
+)
 from .toolkit import *
 from .dataloader import *
 
-class Resnet(Module):
-    depthwise:Convolution
-    layernorm:Layernorm
-    mlp:MLP
-    
-    def __init__(self, features, bias=True, key=None):
+
+class Transformer(Module):
+    attention: SelfAttention
+    mlp: GLU
+    prenorm: Layernorm
+    width: int
+    height: int
+
+    def __init__(
+        self,
+        features: int,
+        heads: int,
+        width: int,
+        height: int,
+        dropout: float = 0,
+        key=None,
+    ):
         key = RNG(key)
-        self.depthwise = Convolution(features, features, kernel=7, padding=3, groups=features, bias=bias, key=next(key))
-        self.layernorm = Layernorm((features,))
-        self.mlp = MLP(features, bias=bias, key=next(key))
+        self.width, self.height = width, height
+        self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
+        self.attention = SelfAttention(
+            features, heads=heads, dropout=dropout, bias=bias, key=next(key)
+        )
+        self.mlp = GLU(features, dropout=dropout, bias=bias, key=next(key))
 
-    def __call__(self, x, key=None):
-        x = self.mlp(self.layernorm(self.depthwise(x))) + x
-        return x
-
-class Upsample(Module):
-    layer:Convolution
-    scale:float = static_field()
-
-    def __init__(self, nin, non, scale=2, bias=True, key=None):
-        self.scale = scale
-        self.layer = Convolution(nin, non, kernel=3, padding=1, bias=bias, key=key)
-    
-    def __call__(self, x, key=None):
-        h, w, c = x.shape
-        x = jax.image.resize(x, (self.scale * h, self.scale * w, c), mode="nearest")
-        x = self.layer(x)
-        return x
-
-class Downsample(Module):
-    layer:Convolution
-    scale:float = static_field()
-
-    def __init__(self, nin, non, scale=2, bias=True, dtype=float, key=None):
-        self.scale = scale
-        self.layer = Convolution(nin, non, kernel=3, stride=scale, padding=1, bias=bias, dtype=dtype, key=key)
-    
-    def __call__(self, x, key=None):
-        x = self.layer(x)
-        return x
-
-class UNet(Module):
-    input:Convolution
-    encoder:list
-    bridge:list
-    decoder:list
-    output:Convolution
-
-    def __init__(self, vocab:int, features:list, blocks:int=3, heads=8, bias=True, key=None):
+    def __call__(self, x: Float[Array, "n d"], key=None):
         key = RNG(key)
-        [first, *_, last] = features
-        ninnon = list(zip(features[:-1], features[1:]))
-        
-        down = lambda nin, non : nn.Sequential(
-            [Resnet(nin, bias=bias, key=next(key)) for _ in range(blocks)] + \
-            [Downsample(nin, non, bias=bias, key=next(key))]
-        )
+        x = self.prenorm(x)
+        x = x + self.attention(x, key=next(key)) + self.mlp(x, key=next(key))
 
-        up = lambda nin, non : nn.Sequential(
-            [Resnet(non+non, bias=bias, key=next(key)) for _ in range(blocks)] + \
-            [Upsample(non+non, nin, bias=bias, key=next(key))]
-        )
+        return x
 
-        self.input = Convolution(vocab, first, kernel=3, padding=1, bias=bias, key=next(key))
-        self.encoder = [down(nin,non) for nin,non in ninnon]
-        self.bridge = CrossAttention(features=last, context=last, heads=heads, bias=bias, key=next(key))
-        self.decoder = [up(nin,non) for nin,non in ninnon] # reverse
-        self.output = Convolution(first, vocab, kernel=3, padding=1, bias=bias, key=next(key))
+
+class Decoder(Module):
+    layers: Sequential
+    wpe: SinusodialEmbedding
+
+    def __init__(
+        self,
+        features: int,
+        vocab: int = 8192,
+        layers: int = 24,
+        dropout: float = 0,
+        bias=False,
+        key=None,
+    ):
+        key = RNG(key)
+        self.embedding = Embedding(vocab, features, dropout=dropout, key=next(key))
+        self.wpe = SinusodialEmbedding(features, dropout=dropout, key=next(key))
+        self.layers = Sequential(
+            [
+                Transformer(features, dropout=dropout, bias=bias, key=next(key))
+                for _ in layers
+            ]
+        )
+        self.layernorm = Layernorm([features])
+        self.head = Projection(features, vocab, bias=bias, key=next(key))
 
     @forward
-    def __call__(self, x, masks, key=None):
-        x, hiddens = self.input(x), []
-
-        for idx, layer in enumerate(self.encoder): 
-            hiddens.append(x := layer(x))
-
-        x = self.attention(x,x)
-        
-        for idx, layer in enumerate(self.decoder):
-            x, _ = pack([layer(x),hiddens[idx]], 'h w *')
-
-        x = self.output(x)
+    def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
+        key = RNG(key)
+        x = self.embedding(x)
+        x = jnp.where(masks == 0, x, jnp.zeros(x.shape, x.dtype))
+        x = x + self.wpe(x)
+        x = self.layers(x, key=next(key))
+        x = self.layernorm(x)
+        x = self.head(x)
 
         return x
 
@@ -108,16 +103,20 @@ from pathlib import Path
 from functools import partial
 from PIL import Image
 
-def sample(ratio): return jnp.cos(.5 * jnp.pi * ratio)
+
+def sample(ratio):
+    return jnp.cos(0.5 * jnp.pi * ratio)
+
 
 @batch
-def create_tensor_masks(idxes, key=None):
+def create_masks(idxes, key=None):
     key = RNG(key)
     ratio = sample(jr.uniform(next(key)))
     masks = jr.uniform(next(key), idxes.shape)
-    masks = jnp.where(masks > ratio, 1, 0) # 1 = NO MASK, 0 = MASK
+    masks = jnp.where(masks > ratio, 1, 0)  # 1 = NO MASK, 0 = MASK
 
     return masks
+
 
 @click.command()
 @click.option("--dataset", type=Path)
@@ -136,17 +135,39 @@ def create_tensor_masks(idxes, key=None):
 @click.option("--length", type=int, default=1024)
 @click.option("--label-smoothing", type=float, default=0.1)
 def train(**cfg):
-    wandb.init(project = "MASKGIT", config = cfg)
+    wandb.init(project="MASKGIT", config=cfg)
     folder = Path(f"VQGAN/autoencoding/{wandb.run.id}")
     folder.mkdir()
 
-    key = jr.PRNGKey(42)
+    key = jr.PRNGKey(cfg["seed"])
     key = RNG(key)
+    dsplit = lambda key: jr.split(key, jax.device_count())
+    transform = T.Compose(
+        [
+            T.ToTensor(),
+            T.Resize(cfg["size"], antialias=True),
+            T.RandomResizedCrop(cfg["size"], scale=(0.8, 1.0), antialias=True),
+            T.RandomHorizontalFlip(0.3),
+            T.RandomAdjustSharpness(2, 0.3),
+            T.RandomAutocontrast(0.3),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize(0.5, 0.5),
+        ]
+    )
 
-    dataset = Path("dataset/megabooru")
-    dataset = ImageDataset(dataset, size=256)
-    loader = dataloader(dataset, cfg["batch"], num_workers=4)
-    loader = cycle(loader)
+    loader = dataloader(
+        "hub://reny/animefaces",
+        tensors=["images"],
+        batch_size=cfg["batch"],
+        transform={"images": transform},
+        decode_method={"images": "numpy"},
+        num_workers=cfg["workers"],
+        shuffle=False,
+    )
+
+    G = Decoder(
+        cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key)
+    )
 
     grads = partial(gradients, precision=cfg["precision"])
     G, states = replicate(G), replicate(states)
@@ -155,16 +176,17 @@ def train(**cfg):
     states = optimisers.init(G)
 
     @ddp
-    def Gstep(G, batch, masks, states, key=None):
+    def Gstep(G, batch, states, key=None):
         key = RNG(key)
 
         @grads
-        def cross_entropy_loss(G, batch, masks):
-            logits = G(batch, key=next(key))
+        def cross_entropy_loss(G, batch):
+            masks = create_masks(batch, jr.split(next(key), len(batch)))
+            logits = G(batch, masks, jr.split(next(key), len(batch)))
             labels = jax.nn.one_hot(batch, cfg["vocab"])
             labels = optax.smooth_labels(labels, cfg["label_smoothing"])
             loss = optax.softmax_cross_entropy(logits, labels)
-            return loss.mean(), { }
+            return loss.mean(), {}
 
         (loss, metrics), gradients = cross_entropy_loss(G, batch)
         updates, states = optimisers.update(gradients, states, G)
@@ -172,18 +194,14 @@ def train(**cfg):
 
         return G, states, loss, metrics
 
-
     for idx in tqdm(range(cfg["total_steps"])):
         batch = next(loader)
-        G, states, Gloss, metrics = Gstep(G, batch, masks, states, key=next(key))
+        G, states, Gloss, metrics = Gstep(G, batch, states, dsplit(next(key)))
 
-        if idx % 16 == 0:
-            checkpoint = { "T":unreplicate(G), "states":unreplicate(states), "optimisers":optimisers }
-            save(folder / f"{idx}.nox", checkpoint)
-
-        wandb.log({ "loss":onp.mean(Gloss) })
+        wandb.log({"loss": onp.mean(Gloss)})
 
     wandb.finish()
+
 
 if __name__ == "__main__":
     train()

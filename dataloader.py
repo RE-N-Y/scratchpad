@@ -21,17 +21,9 @@ def cycle(loader, tensors=[]):
             yield batch
 
 
-def dataloader(name:str, tensors=[], transform=[], batch_size:int=4, decode_method={}, shuffle=True, num_workers=4):
+def dataloader(name:str, tensors=[], transform=[], **kwargs):
     ds = deeplake.load(name)
-    loader = ds.pytorch(
-        tensors=tensors, 
-        transform=transform, 
-        batch_size=batch_size, 
-        shuffle=shuffle, 
-        decode_method=decode_method,
-        num_workers=num_workers
-    )
-
+    loader = ds.pytorch(tensors=tensors, transform=transform, **kwargs)
     loader = cycle(loader, tensors=tensors)
 
     return loader
