@@ -132,74 +132,88 @@ class VectorQuantiser(Module):
 
         return codes, loss, idxes
 
-class Imageformer(Module):
-    attention:SelfAttention
+class Mixer(Module):
+    mixer:Convolution
     mlp:GLU
     prenorm:Layernorm
     postnorm:Layernorm
-    width:int
-    height:int
 
-    def __init__(self, features:int, heads:int, width:int, height:int, bias=False, dropout:float=0, key=None):
+    def __init__(self, features:int, bias=False, dropout:float=0, key=None):
         key = RNG(key)
-        self.width, self.height = width, height
         self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
-        self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
+        self.mixer = Convolution(features, features, kernel=7, padding=3, bias=bias, key=next(key))
         self.mlp = GLU(features, dropout=dropout, bias=bias, key=next(key))
 
-    def __call__(self, x:Float[Array, "n d"], key=None):
+    def __call__(self, x:Float[Array, "h w d"], key=None):
         key = RNG(key)
-        x = self.attention(self.prenorm(x), key=next(key)) + x
-        x = self.mlp(self.postnorm(x), key=next(key)) + x
-        
+        x = self.mixer(self.prenorm(x)) + x
+        x = self.mlp(self.postnorm(x)) + x
+
         return x
 
+class Down(Module):
+    sample:Convolution
+
+    def __init__(self, nin:int, non:int, bias=False, key=None):
+        key = RNG(key)
+        self.sample = Convolution(nin, non, kernel=3, stride=2, padding=1, bias=bias, key=next(key))
+
+    def __call__(self, x:Float[Array, "h w d"], key=None):
+        return self.sample(x)
+    
+class Up(Module):
+    sample:Convolution
+
+    def __init__(self, nin:int, non:int, bias=False, key=None):
+        key = RNG(key)
+        self.sample = Convolution(nin, non, kernel=3, stride=1, padding=1, bias=bias, key=next(key))
+
+    def __call__(self, x:Float[Array, "h w d"], key=None):
+        h, w, c = x.shape
+        x = jax.image.resize(x, (h * 2, w * 2, c), method='bilinear')
+        return self.sample(x)
+
 class VQVAE(Module):
-    epe:jnp.ndarray
-    dpe:jnp.ndarray
     input:Convolution
-    encoder:nn.Sequential
+    encoder:Sequential
     quantiser:VectorQuantiser
-    decoder:nn.Sequential
+    decoder:Sequential
     output:Convolution
     size:int
     patch:int
 
 
-    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=8, size:int=256, dropout:float=0, bias=True, key=None):
+    def __init__(self, features:int=96, codes:int=32, pages:int=8192, depth:int=4, size:int=256, bias=True, key=None):
         key = RNG(key)
         self.size = size
-        self.patch = patch
 
-        ntoken = size//patch
-        self.epe = jnp.zeros((ntoken ** 2, features))
-        self.dpe = jnp.zeros((ntoken ** 2, features))
-
-        # patchify
-        self.input = Convolution(3, features, patch, stride=patch, bias=bias, key=next(key))
-        # encoder
-        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
-        self.encoder = Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
+        # input
+        self.input = Down(3, features, bias=bias, key=next(key))
+        self.encoder = Sequential([
+            *[Mixer(features, bias=bias, key=next(key)) for _ in range(depth)], Down(features, 2 * features, bias=bias, key=next(key)),
+            *[Mixer(2 * features, bias=bias, key=next(key)) for _ in range(depth)], Down(2 * features, 4 * features, bias=bias, key=next(key))
+        ])
         # quantiser
         self.quantiser = VectorQuantiser(features, codes, pages, bias=bias, key=next(key))
         # decoder
-        transformers = [Imageformer(features, width=ntoken, height=ntoken, heads=heads, dropout=dropout, key=next(key)) for _ in range(depth)]
-        self.decoder = Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
-        # pixelshuffle
-        self.output = Convolution(features, 3 * patch * patch, 1, bias=bias, key=next(key))
+        self.decoder = Sequential([
+            Up(4 * features, 2 * features, bias=bias, key=next(key)), *[Mixer(2 * features, bias=bias, key=next(key)) for _ in range(depth)],
+            Up(2 * features, features, bias=bias, key=next(key)), *[Mixer(features, bias=bias, key=next(key)) for _ in range(depth)]
+        ])
+        self.output = Up(features, 3, bias=bias, key=next(key))
 
     @forward
     def __call__(self, x:Float[Array, "h w c"], key=None):
         key = RNG(key)
-        ratio = self.size // self.patch
-        x = rearrange(self.input(x), 'h w c -> (h w) c')
 
-        x = self.encoder(x + self.epe, key=next(key))
+        x = self.encoder(x, key=next(key))
+
+        h, w, c = x.shape
+        x = rearrange(x, 'h w c -> (h w) c')
         codes, loss, idxes = self.quantiser(x)
-        x = self.decoder(codes + self.dpe, key=next(key))
-
-        x = rearrange(x, '(h w) c -> h w c', h=ratio, w=ratio)
-        x = rearrange(self.output(x), 'h w (hr wr c) -> (h hr) (w wr) c', hr=self.patch, wr=self.patch)
+        codes = rearrange(codes, '(h w) c -> h w c', h=h, w=w)
+        
+        x = self.decoder(codes, key=next(key))
 
         return x, codes, loss, idxes
 
@@ -217,7 +231,6 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
 @click.option("--cooldown", type=float, default=1e-6)
 @click.option("--batch", default=64, type=int)
 @click.option("--size", default=256, type=int)
-@click.option("--patch", type=int, default=8)
 @click.option("--features", type=int, default=768)
 @click.option("--pages", type=int, default=8192)
 @click.option("--heads", type=int, default=12)
@@ -260,7 +273,7 @@ def train(**cfg):
     augmentation = CoinFlip(augmentation)
 
     grads = partial(gradients, precision=cfg["precision"])
-    G = VQVAE(cfg["features"], pages=cfg["pages"], patch=cfg["patch"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
+    G = VQVAE(cfg["features"], pages=cfg["pages"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.lion(Goptim, b1=0.95, b2=0.98, weight_decay=0.1)
