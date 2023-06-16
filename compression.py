@@ -135,19 +135,17 @@ class VectorQuantiser(Module):
 class Mixer(Module):
     mixer:Convolution
     mlp:GLU
-    prenorm:Layernorm
-    postnorm:Layernorm
+    layernorm:Layernorm
 
     def __init__(self, features:int, bias=False, dropout:float=0, key=None):
         key = RNG(key)
-        self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
+        self.layernorm = Layernorm([features])
         self.mixer = Convolution(features, features, kernel=7, padding=3, bias=bias, key=next(key))
         self.mlp = GLU(features, dropout=dropout, bias=bias, key=next(key))
 
     def __call__(self, x:Float[Array, "h w d"], key=None):
         key = RNG(key)
-        x = self.mixer(self.prenorm(x), key=next(key)) + x
-        x = self.mlp(self.postnorm(x), key=next(key)) + x
+        x = self.mlp(self.layernorm(self.mixer(x, key=next(key))), key=next(key)) + x
 
         return x
 
@@ -176,13 +174,11 @@ class Up(Module):
 class VQVAE(Module):
     input:Convolution
     encoder:Sequential
-    preattend:SelfAttention
     quantiser:VectorQuantiser
-    postattend:SelfAttention
     decoder:Sequential
     output:Convolution
 
-    def __init__(self, features:int=96, codes:int=32, pages:int=8192, depth:int=4, dropout:float=0, bias=True, key=None):
+    def __init__(self, features:int=128, codes:int=32, pages:int=8192, depth:int=4, dropout:float=0, bias=True, key=None):
         key = RNG(key)
 
         # input
@@ -190,15 +186,15 @@ class VQVAE(Module):
         self.encoder = Sequential([
             *[Mixer(features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Down(features, 2 * features, bias=bias, key=next(key)),
             *[Mixer(2 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Down(2 * features, 4 * features, bias=bias, key=next(key)),
+            *[Mixer(4 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
         ])
         # quantiser
-        self.preattend = SelfAttention(4 * features, heads=6, bias=bias, key=next(key))
         self.quantiser = VectorQuantiser(4 * features, codes, pages, bias=bias, key=next(key))
-        self.postattend = SelfAttention(4 * features, heads=6, bias=bias, key=next(key))
         # decoder
         self.decoder = Sequential([
-            Up(4 * features, 2 * features, bias=bias, key=next(key)), *[Mixer(2 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)],
-            Up(2 * features, features, bias=bias, key=next(key)), *[Mixer(features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
+            *[Mixer(4 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Up(4 * features, 2 * features, bias=bias, key=next(key)), 
+            *[Mixer(2 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Up(2 * features, features, bias=bias, key=next(key)), 
+            *[Mixer(features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
         ])
         self.output = Up(features, 3, bias=bias, key=next(key))
 
@@ -211,11 +207,7 @@ class VQVAE(Module):
 
         h, w, c = x.shape
         x = rearrange(x, 'h w c -> (h w) c')
-
-        x = self.preattend(x, key=next(key))
         codes, loss, idxes = self.quantiser(x)
-        codes = self.postattend(codes, key=next(key))
-
         codes = rearrange(codes, '(h w) c -> h w c', h=h, w=w)
         
         x = self.decoder(codes, key=next(key))
@@ -237,7 +229,7 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
 @click.option("--cooldown", type=float, default=0)
 @click.option("--batch", default=32, type=int)
 @click.option("--size", default=512, type=int)
-@click.option("--features", type=int, default=768)
+@click.option("--features", type=int, default=128)
 @click.option("--pages", type=int, default=8192)
 @click.option("--depth", type=int, default=4)
 @click.option("--dropout", type=float, default=0)
@@ -275,7 +267,7 @@ def train(**cfg):
 
     lpips = LPIPS.load()
     grads = partial(gradients, precision=cfg["precision"])
-    G = VQVAE(cfg["features"], pages=cfg["pages"], dropout=cfg["dropout"], bias=cfg["bias"], key=next(key))
+    G = VQVAE(cfg["features"], pages=cfg["pages"], depth=cfg["depth"], dropout=cfg["dropout"], bias=cfg["bias"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.adabelief(Goptim)
