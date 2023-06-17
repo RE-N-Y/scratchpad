@@ -18,7 +18,7 @@ import torch
 import torchvision.transforms as T
 from dataloader import dataloader
 
-
+import deeplake
 import wandb
 import click
 import math
@@ -209,6 +209,52 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
     x = onp.asarray(x * 255, dtype=onp.uint8)
     return x
 
+
+
+@click.command()
+@click.option("--batch", default=64, type=int)
+@click.option("--size", default=256, type=int)
+@click.option("--features", type=int, default=768)
+@click.option("--pages", type=int, default=8192)
+@click.option("--heads", type=int, default=12)
+@click.option("--depth", type=int, default=12)
+@click.option("--dropout", type=float, default=0)
+@click.option("--bias", type=bool, default=False)
+@click.option("--seed", type=int, default=42)
+@click.option("--workers", type=int, default=16)
+@click.option("--checkpoint", type=Path)
+def encode(**cfg):
+    key = jr.PRNGKey(cfg["seed"])
+    key = RNG(key)
+    dsplit = lambda key : jr.split(key, jax.device_count())
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Resize(cfg["size"], antialias=True),
+        T.ConvertImageDtype(torch.float), 
+        T.Normalize(0.5, 0.5)
+    ])
+
+    model = VQVAE(cfg["features"], pages=cfg["pages"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
+    model = load(cfg["checkpoint"] / "G.weight", model)
+    model = replicate(model)
+
+    ds = deeplake.load("hub://reny/animefaces")
+    ds.create_tensor("64x64", htype="list")
+    loader = ds.pytorch(tensors=["images"], transform={"images":transform}, batch_size=cfg["batch"], num_workers=cfg["workers"], shuffle=False)
+    
+    @ddp
+    def quantise(G, images, key=None):
+        fakes, codes, loss, idxes = G(images, jr.split(key, len(images)))
+        return codes
+
+    with ds:
+        for batch in tqdm(loader):
+            batch = rearrange(batch["images"], "... c h w -> ... h w c")
+            batch = jnp.asarray(batch)
+            codes = quantise(model, batch, dsplit(next(key)))
+            codes = rearrange(codes, "n mb ... -> (n mb) ...")
+            ds["64x64"].extend(onp.asarray(codes))
+
 @click.command()
 @click.option("--dataset", type=Path)
 @click.option("--steps", default=1000042, type=int)
@@ -260,7 +306,7 @@ def train(**cfg):
     augmentation = CoinFlip(augmentation)
 
     grads = partial(gradients, precision=cfg["precision"])
-    G = VQVAE(cfg["features"], pages=cfg["pages"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
+    G = VQVAE(cfg["features"], pages=cfg["pages"], patch=cfg["patch"], heads=cfg["heads"], dropout=cfg["dropout"], bias=cfg["bias"], size=cfg["size"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.lion(Goptim, b1=0.9, b2=0.99, weight_decay=1.)
