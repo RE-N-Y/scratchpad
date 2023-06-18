@@ -7,8 +7,6 @@ import optax
 import numpy as onp
 import equinox
 from equinox import nn, static_field, Module
-from equinox.serialisation import tree_serialise_leaves as save
-from equinox.serialisation import tree_deserialise_leaves as load
 from einops import rearrange, reduce, repeat, pack
 from .layers import (
     Convolution,
@@ -24,6 +22,8 @@ from .layers import (
 from .toolkit import *
 from .dataloader import *
 
+load = equinox.tree_deserialise_leaves
+save = equinox.tree_serialise_leaves
 
 class Transformer(Module):
     attention: SelfAttention
