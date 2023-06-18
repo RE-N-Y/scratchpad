@@ -8,7 +8,7 @@ import numpy as onp
 import equinox
 from equinox import nn, static_field, Module
 from einops import rearrange, reduce, repeat, pack
-from .layers import (
+from layers import (
     Convolution,
     Layernorm,
     Projection,
@@ -19,8 +19,8 @@ from .layers import (
     SinusodialEmbedding,
     Embedding,
 )
-from .toolkit import *
-from .dataloader import *
+from toolkit import *
+from dataloader import *
 
 load = equinox.tree_deserialise_leaves
 save = equinox.tree_serialise_leaves
