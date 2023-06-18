@@ -29,20 +29,17 @@ class Transformer(Module):
     attention: SelfAttention
     mlp: GLU
     prenorm: Layernorm
-    width: int
-    height: int
+    postnorm: Layernorm
 
     def __init__(
         self,
         features: int,
-        heads: int,
-        width: int,
-        height: int,
+        heads: int = 12,
+        bias = False,
         dropout: float = 0,
         key=None,
     ):
         key = RNG(key)
-        self.width, self.height = width, height
         self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
         self.attention = SelfAttention(
             features, heads=heads, dropout=dropout, bias=bias, key=next(key)
@@ -51,15 +48,19 @@ class Transformer(Module):
 
     def __call__(self, x: Float[Array, "n d"], key=None):
         key = RNG(key)
-        x = self.prenorm(x)
-        x = x + self.attention(x, key=next(key)) + self.mlp(x, key=next(key))
+        x = self.attention(self.prenorm(x), key=next(key)) + x
+        x = self.mlp(self.postnorm(x), key=next(key)) + x
 
         return x
 
 
 class Decoder(Module):
     layers: Sequential
-    wpe: SinusodialEmbedding
+    embedding:Embedding
+    wpe:jnp.ndarray
+    layernorm:Layernorm
+    head:Projection
+
 
     def __init__(
         self,
@@ -71,12 +72,12 @@ class Decoder(Module):
         key=None,
     ):
         key = RNG(key)
-        self.embedding = Embedding(vocab, features, dropout=dropout, key=next(key))
-        self.wpe = SinusodialEmbedding(features, dropout=dropout, key=next(key))
+        self.embedding = Embedding(vocab, features, key=next(key))
+        self.wpe = jnp.zeros((256, features))
         self.layers = Sequential(
             [
                 Transformer(features, dropout=dropout, bias=bias, key=next(key))
-                for _ in layers
+                for _ in range(layers)
             ]
         )
         self.layernorm = Layernorm([features])
@@ -86,8 +87,8 @@ class Decoder(Module):
     def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
         key = RNG(key)
         x = self.embedding(x)
-        x = jnp.where(masks == 0, x, jnp.zeros(x.shape, x.dtype))
-        x = x + self.wpe(x)
+        x = jnp.where(rearrange(masks == 0, 'n -> n 1'), x, jnp.zeros(x.shape, x.dtype))
+        x = x + self.wpe
         x = self.layers(x, key=next(key))
         x = self.layernorm(x)
         x = self.head(x)
@@ -125,37 +126,48 @@ def masks(idxes, key=None):
 @click.option("--warmup", default=4096, type=int)
 @click.option("--cooldown", type=float, default=1e-6)
 @click.option("--lr", type=float, default=3e-4)
-@click.option("--batch", default=4200, type=int)
-@click.option("--minibatch", default=6, type=int)
+@click.option("--batch", default=256, type=int)
 @click.option("--features", type=int, default=768)
 @click.option("--vocab", type=int, default=8192)
 @click.option("--heads", type=int, default=8)
 @click.option("--depth", type=int, default=24)
 @click.option("--dropout", type=float, default=0)
-@click.option("--length", type=int, default=1024)
+@click.option("--seed", type=int, default=42)
+@click.option("--workers", default=32)
+@click.option("--precision", default="half")
 def train(**cfg):
     wandb.init(project="MASKGIT", config=cfg)
-    folder = Path(f"VQGAN/autoencoding/{wandb.run.id}")
+    folder = Path(f"checkpoints/{wandb.run.id}")
     folder.mkdir()
 
     key = jr.PRNGKey(cfg["seed"])
     key = RNG(key)
     dsplit = lambda key: jr.split(key, jax.device_count())
 
-    loader = dataloader("hub://reny/animefaces", tensors=["16x16"], batch_size=cfg["batch"], num_workers=cfg["workers"], shuffle=False)
+    def tform(sample):
+        return onp.array(sample)
+
+    loader = dataloader(
+        "hub://reny/animefaces", 
+        tensors=["16x16"], 
+        batch_size=cfg["batch"],
+        transform={"16x16":tform},
+        num_workers=cfg["workers"], 
+        shuffle=True
+    )
 
     G = Decoder(cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key))
 
     grads = partial(gradients, precision=cfg["precision"])
-    G, states = replicate(G), replicate(states)
-
-    optimisers = optax.adamw(cfg["lr"])
+    optimisers = optax.adamw(cfg["lr"], b1=0.9, b2=0.96)
     states = optimisers.init(G)
+
+    G, states = replicate(G), replicate(states)
 
     @ddp
     def Gstep(G, batch, states, key=None):
         key = RNG(key)
-
+        
         @grads
         def cross_entropy_loss(G, batch):
             m = masks(batch, jr.split(next(key), len(batch)))
@@ -171,10 +183,9 @@ def train(**cfg):
 
         return G, states, loss, metrics
 
-    for idx in tqdm(range(cfg["total_steps"])):
+    for idx in tqdm(range(cfg["steps"])):
         batch = next(loader)
-        G, states, Gloss, metrics = Gstep(G, batch, states, dsplit(next(key)))
-
+        G, states, Gloss, metrics = Gstep(G, batch["16x16"], states, dsplit(next(key)))
         wandb.log({"loss": onp.mean(Gloss)})
 
     wandb.finish()
