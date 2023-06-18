@@ -166,7 +166,7 @@ class VQVAE(Module):
     patch:int
 
 
-    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=8, size:int=256, dropout:float=0, bias=True, key=None):
+    def __init__(self, features:int=768, codes:int=32, pages:int=8192, heads:int=12, depth:int=12, patch:int=16, size:int=256, dropout:float=0, bias=True, key=None):
         key = RNG(key)
         self.size = size
         self.patch = patch
@@ -239,21 +239,21 @@ def encode(**cfg):
     model = replicate(model)
 
     ds = deeplake.load("hub://reny/animefaces")
-    ds.create_tensor("64x64", htype="list")
+    ds.create_tensor("16x16")
     loader = ds.pytorch(tensors=["images"], transform={"images":transform}, batch_size=cfg["batch"], num_workers=cfg["workers"], shuffle=False)
     
     @ddp
     def quantise(G, images, key=None):
         fakes, codes, loss, idxes = G(images, jr.split(key, len(images)))
-        return codes
+        return idxes
 
     with ds:
         for batch in tqdm(loader):
             batch = rearrange(batch["images"], "... c h w -> ... h w c")
             batch = jnp.asarray(batch)
-            codes = quantise(model, batch, dsplit(next(key)))
-            codes = rearrange(codes, "n mb ... -> (n mb) ...")
-            ds["64x64"].extend(onp.asarray(codes))
+            idxes = quantise(model, batch, dsplit(next(key)))
+            idxes = rearrange(idxes, "n mb ... -> (n mb) ...")
+            ds["16x16"].extend(onp.asarray(idxes))
 
 @click.command()
 @click.option("--dataset", type=Path)
@@ -364,4 +364,4 @@ def train(**cfg):
     wandb.finish()
 
 if __name__ == "__main__":
-    train()
+    encode()
