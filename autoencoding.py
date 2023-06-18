@@ -109,7 +109,7 @@ def sample(ratio):
 
 
 @batch
-def create_masks(idxes, key=None):
+def masks(idxes, key=None):
     key = RNG(key)
     ratio = sample(jr.uniform(next(key)))
     masks = jr.uniform(next(key), idxes.shape)
@@ -121,9 +121,9 @@ def create_masks(idxes, key=None):
 @click.command()
 @click.option("--dataset", type=Path)
 @click.option("--compressor", type=Path)
-@click.option("--total-steps", default=3042, type=int)
-@click.option("--warmup-steps", default=300, type=int)
-@click.option("--decay-steps", default=2742, type=int)
+@click.option("--steps", default=1000042, type=int)
+@click.option("--warmup", default=4096, type=int)
+@click.option("--cooldown", type=float, default=1e-6)
 @click.option("--lr", type=float, default=3e-4)
 @click.option("--batch", default=4200, type=int)
 @click.option("--minibatch", default=6, type=int)
@@ -133,7 +133,6 @@ def create_masks(idxes, key=None):
 @click.option("--depth", type=int, default=24)
 @click.option("--dropout", type=float, default=0)
 @click.option("--length", type=int, default=1024)
-@click.option("--label-smoothing", type=float, default=0.1)
 def train(**cfg):
     wandb.init(project="MASKGIT", config=cfg)
     folder = Path(f"VQGAN/autoencoding/{wandb.run.id}")
@@ -142,37 +141,15 @@ def train(**cfg):
     key = jr.PRNGKey(cfg["seed"])
     key = RNG(key)
     dsplit = lambda key: jr.split(key, jax.device_count())
-    transform = T.Compose(
-        [
-            T.ToTensor(),
-            T.Resize(cfg["size"], antialias=True),
-            T.RandomResizedCrop(cfg["size"], scale=(0.8, 1.0), antialias=True),
-            T.RandomHorizontalFlip(0.3),
-            T.RandomAdjustSharpness(2, 0.3),
-            T.RandomAutocontrast(0.3),
-            T.ConvertImageDtype(torch.float),
-            T.Normalize(0.5, 0.5),
-        ]
-    )
 
-    loader = dataloader(
-        "hub://reny/animefaces",
-        tensors=["images"],
-        batch_size=cfg["batch"],
-        transform={"images": transform},
-        decode_method={"images": "numpy"},
-        num_workers=cfg["workers"],
-        shuffle=False,
-    )
+    loader = dataloader("hub://reny/animefaces", tensors=["16x16"], batch_size=cfg["batch"], num_workers=cfg["workers"], shuffle=False)
 
-    G = Decoder(
-        cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key)
-    )
+    G = Decoder(cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key))
 
     grads = partial(gradients, precision=cfg["precision"])
     G, states = replicate(G), replicate(states)
 
-    optimisers = optax.adam(cfg["lr"], 0.9, 0.96)
+    optimisers = optax.adamw(cfg["lr"])
     states = optimisers.init(G)
 
     @ddp
@@ -181,11 +158,11 @@ def train(**cfg):
 
         @grads
         def cross_entropy_loss(G, batch):
-            masks = create_masks(batch, jr.split(next(key), len(batch)))
-            logits = G(batch, masks, jr.split(next(key), len(batch)))
+            m = masks(batch, jr.split(next(key), len(batch)))
+            logits = G(batch, m, jr.split(next(key), len(batch)))
             labels = jax.nn.one_hot(batch, cfg["vocab"])
-            labels = optax.smooth_labels(labels, cfg["label_smoothing"])
-            loss = optax.softmax_cross_entropy(logits, labels)
+            labels = optax.smooth_labels(labels, 0.1)
+            loss = optax.softmax_cross_entropy(logits, labels) * (1 - m)
             return loss.mean(), {}
 
         (loss, metrics), gradients = cross_entropy_loss(G, batch)
