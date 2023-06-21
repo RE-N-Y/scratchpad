@@ -54,9 +54,64 @@ class Transformer(Module):
         return x
 
 
-class Decoder(Module):
+class Encoder(Module):
+    cls:jnp.ndarray
     layers: Sequential
     embedding:Embedding
+    wpe:jnp.ndarray
+    layernorm:Layernorm
+    head:Projection
+    dr:int
+
+
+    def __init__(
+        self,
+        features:int=1024,
+        heads:int=16,
+        vocab:int=8192,
+        layers:int=24,
+        dropout:float=0,
+        bias=False,
+        key=None,
+    ):
+        CLS = MASK = 1
+        key = RNG(key)
+
+        self.dr = 128
+        self.embedding = Embedding(CLS + MASK + vocab, features, key=next(key))
+        self.wpe = jnp.zeros((CLS + 256, features))
+        self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
+        self.layernorm = Layernorm([features])
+
+    def sampler(self, x:Integer[Array,"n"], key=None):
+        key = RNG(key)
+        mr = 0.25 * jr.truncated_normal(next(key), -0.2, 1.8) + 0.55
+        idxes = jr.permutation(next(key), jnp.arange(len(x)))
+        
+        drops = idxes[:self.dr]
+        masks = idxes[self.dr:]
+        masks = masks[jnp.linspace(0.5, 1, len(masks)) < mr]
+        masks = jnp.concatenate([drops, masks])
+
+        x[masks].
+
+        return         
+
+
+    @forward
+    def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
+        key = RNG(key)
+        x = self.embedding(x)
+        x = x + self.wpe
+        
+        x = self.layers(x, key=next(key))
+        x = self.layernorm(x)
+
+        return x
+
+class Decoder(Module):
+    layers:Sequential
+    projection:Projection
     wpe:jnp.ndarray
     layernorm:Layernorm
     head:Projection
@@ -64,22 +119,19 @@ class Decoder(Module):
 
     def __init__(
         self,
-        features: int,
-        vocab: int = 8192,
-        layers: int = 24,
-        dropout: float = 0,
+        channels:int=1024,
+        features:int=512,
+        heads:int=8,
+        vocab:int=8192,
+        layers:int=8,
+        dropout:float=0,
         bias=False,
         key=None,
     ):
         key = RNG(key)
-        self.embedding = Embedding(vocab, features, key=next(key))
+        self.projection = Projection(channels, features, bias=bias, key=next(key))
         self.wpe = jnp.zeros((256, features))
-        self.layers = Sequential(
-            [
-                Transformer(features, dropout=dropout, bias=bias, key=next(key))
-                for _ in range(layers)
-            ]
-        )
+        self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
         self.layernorm = Layernorm([features])
         self.head = Projection(features, vocab, bias=bias, key=next(key))
 
@@ -117,6 +169,13 @@ def masks(idxes, key=None):
     masks = jnp.where(masks > ratio, 1, 0)  # 1 = NO MASK, 0 = MASK
 
     return masks
+
+@batch
+def accuracy(logits, labels, masks):
+    logits = jnp.argmax(logits, axis=-1)
+    correct = jnp.sum(jnp.where(logits == labels, 1, 0) * masks)
+    total = jnp.sum(masks)
+    return correct / total
 
 
 @click.command()
@@ -187,6 +246,10 @@ def train(**cfg):
         batch = next(loader)
         G, states, Gloss, metrics = Gstep(G, batch["16x16"], states, dsplit(next(key)))
         wandb.log({"loss": onp.mean(Gloss)})
+
+        if idx % 4096 == 0:
+            save(folder / "G.weight", unreplicate(G))
+            save(folder / "states.ckpt", unreplicate(states))
 
     wandb.finish()
 
