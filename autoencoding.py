@@ -6,7 +6,7 @@ from jaxtyping import Float, Integer, Array
 import optax
 import numpy as onp
 import equinox
-from equinox import nn, static_field, Module
+from equinox import nn, static_field as buffer, Module
 from einops import rearrange, reduce, repeat, pack
 from layers import (
     Convolution,
@@ -55,14 +55,15 @@ class Transformer(Module):
 
 
 class Encoder(Module):
-    cls:jnp.ndarray
     layers: Sequential
     embedding:Embedding
     wpe:jnp.ndarray
     layernorm:Layernorm
     head:Projection
-    dr:int
-
+    dr:int = buffer()
+    cls:int = buffer()
+    mask:int = buffer()
+    vocab:int = buffer()
 
     def __init__(
         self,
@@ -76,38 +77,49 @@ class Encoder(Module):
     ):
         CLS = MASK = 1
         key = RNG(key)
-
+    
         self.dr = 128
+        self.vocab = vocab
+        self.cls, self.mask = vocab, vocab + 1
         self.embedding = Embedding(CLS + MASK + vocab, features, key=next(key))
-        self.wpe = jnp.zeros((CLS + 256, features))
+        self.wpe = jr.normal(next(key), (CLS + 256, features))
         self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
         self.layernorm = Layernorm([features])
 
     def sampler(self, x:Integer[Array,"n"], key=None):
         key = RNG(key)
-        mr = 0.25 * jr.truncated_normal(next(key), -0.2, 1.8) + 0.55
+        mr = 0.25 * jr.truncated_normal(next(key), -0.2, 1.8, dtype=x.dtype) + 0.55
         idxes = jr.permutation(next(key), jnp.arange(len(x)))
         
         drops = idxes[:self.dr]
         masks = idxes[self.dr:]
-        masks = masks[jnp.linspace(0.5, 1, len(masks)) < mr]
+        
+        rolls = jnp.linspace(0.5, 1, len(masks), dtype=x.dtype)
+        keeps = masks[rolls > mr]
+        masks = masks[rolls < mr]
         masks = jnp.concatenate([drops, masks])
 
-        x[masks].
+        x = x.at[masks].set(self.mask)
+        x = x[keeps]
 
-        return         
+        CLS = jnp.array([self.cls])
+        x = jnp.concatenate([CLS, x])
+
+        return x, masks, keeps, drops         
 
 
     @forward
-    def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
+    def __call__(self, x: Integer[Array, "n"], key=None):
         key = RNG(key)
+
+        x, masks, keeps, drops = self.sampler(x, next(key))
         x = self.embedding(x)
         x = x + self.wpe
         
         x = self.layers(x, key=next(key))
         x = self.layernorm(x)
 
-        return x
+        return x, masks, keeps, drops
 
 class Decoder(Module):
     layers:Sequential
@@ -130,21 +142,42 @@ class Decoder(Module):
     ):
         key = RNG(key)
         self.projection = Projection(channels, features, bias=bias, key=next(key))
-        self.wpe = jnp.zeros((256, features))
+        self.wpe = jr.normal(next(key), (256, features))
         self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
         self.layernorm = Layernorm([features])
         self.head = Projection(features, vocab, bias=bias, key=next(key))
 
     @forward
-    def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
+    def __call__(self, x:Integer[Array,"n"], masks:Integer[Array,"n"], keeps:Integer[Array,"n"], key=None):
         key = RNG(key)
-        x = self.embedding(x)
-        x = jnp.where(rearrange(masks == 0, 'n -> n 1'), x, jnp.zeros(x.shape, x.dtype))
+        x = self.projection(x)
+        CLS, x = x[:,:1], x[:,1:]
+
+        slate = jnp.zeros((256,512), dtype=x.dtype)
+        slate = slate.at[keeps].set(x)
+        slate = slate.at[masks].set(CLS)
+
         x = x + self.wpe
         x = self.layers(x, key=next(key))
         x = self.layernorm(x)
         x = self.head(x)
 
+        return x
+
+class MAGE(Module):
+    encoder:Encoder
+    decoder:Decoder
+
+    def __init__(self, features:int=1024, heads:int=16, vocab:int=8192, layers:int=24, dropout:float=0, bias=False, key=None):
+        key = RNG(key)
+        self.encoder = Encoder(next(key))
+        self.decoder = Decoder(next(key))
+
+    @forward
+    def __call__(self, x:Integer[Array,"n"], key=None):
+        key = RNG(key)
+        x, masks, keeps, drops = self.encoder(x, key=next(key))
+        x = self.decoder(x, masks, keeps, key=next(key))
         return x
 
 
