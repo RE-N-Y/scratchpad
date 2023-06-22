@@ -53,7 +53,6 @@ class Transformer(Module):
 
         return x
 
-
 class Decoder(Module):
     layers: Sequential
     embedding:Embedding
@@ -73,7 +72,7 @@ class Decoder(Module):
     ):
         key = RNG(key)
         self.embedding = Embedding(vocab, features, key=next(key))
-        self.wpe = jnp.zeros((256, features))
+        self.wpe = jr.normal(next(key), (256, features))
         self.layers = Sequential(
             [
                 Transformer(features, dropout=dropout, bias=bias, key=next(key))
@@ -87,7 +86,7 @@ class Decoder(Module):
     def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
         key = RNG(key)
         x = self.embedding(x)
-        x = jnp.where(rearrange(masks == 0, 'n -> n 1'), x, jnp.zeros(x.shape, x.dtype))
+        x = jnp.where(rearrange(masks == 1, 'n -> n 1'), x, jnp.zeros(x.shape, x.dtype))
         x = x + self.wpe
         x = self.layers(x, key=next(key))
         x = self.layernorm(x)
@@ -115,16 +114,26 @@ def masks(idxes, key=None):
     ratio = sample(jr.uniform(next(key)))
     masks = jr.uniform(next(key), idxes.shape)
     masks = jnp.where(masks > ratio, 1, 0)  # 1 = NO MASK, 0 = MASK
+    masks = masks.at[0].set(0)
+    masks = jr.permutation(next(key), masks)
 
     return masks
+
+@batch
+def accuracy(logits, labels, masks):
+    imasks = 1 - masks
+    logits = jnp.argmax(logits, axis=-1)
+    correct = jnp.sum(jnp.where(logits == labels, 1, 0) * imasks)
+    total = jnp.sum(imasks)
+    return correct / total
 
 
 @click.command()
 @click.option("--dataset", type=Path)
 @click.option("--compressor", type=Path)
-@click.option("--steps", default=1000042, type=int)
-@click.option("--warmup", default=4096, type=int)
-@click.option("--cooldown", type=float, default=1e-6)
+@click.option("--steps", default=256, type=int)
+@click.option("--warmup", default=32, type=int)
+@click.option("--cooldown", type=float, default=224)
 @click.option("--lr", type=float, default=3e-4)
 @click.option("--batch", default=256, type=int)
 @click.option("--features", type=int, default=768)
@@ -147,7 +156,7 @@ def train(**cfg):
     def tform(sample):
         return onp.array(sample)
 
-    loader = dataloader(
+    loader, length = dataloader(
         "hub://reny/animefaces", 
         tensors=["16x16"], 
         batch_size=cfg["batch"],
@@ -157,17 +166,20 @@ def train(**cfg):
     )
 
     G = Decoder(cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key))
-
+    
+    cfg["warmup"], cfg["steps"], cfg["cooldown"] = cfg["warmup"] * length, cfg["steps"] * length, cfg["cooldown"] * length
     grads = partial(gradients, precision=cfg["precision"])
-    optimisers = optax.adamw(cfg["lr"], b1=0.9, b2=0.96)
-    states = optimisers.init(G)
+    # lr = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
+    optimisers = optax.adabelief(cfg["lr"])
+    # optimisers = optax.MultiSteps(optimisers, 4)
+    states = optimisers.init(parameters(G))
 
     G, states = replicate(G), replicate(states)
 
     @ddp
     def Gstep(G, batch, states, key=None):
         key = RNG(key)
-        
+
         @grads
         def cross_entropy_loss(G, batch):
             m = masks(batch, jr.split(next(key), len(batch)))
@@ -175,7 +187,9 @@ def train(**cfg):
             labels = jax.nn.one_hot(batch, cfg["vocab"])
             labels = optax.smooth_labels(labels, 0.1)
             loss = optax.softmax_cross_entropy(logits, labels) * (1 - m)
-            return loss.mean(), {}
+            loss = jnp.sum(loss) / jnp.sum(1 - m)
+
+            return loss, { "accuracy" : accuracy(logits, batch, m), "masking" : 1 - m }
 
         (loss, metrics), gradients = cross_entropy_loss(G, batch)
         updates, states = optimisers.update(gradients, states, G)
@@ -186,10 +200,13 @@ def train(**cfg):
     for idx in tqdm(range(cfg["steps"])):
         batch = next(loader)
         G, states, Gloss, metrics = Gstep(G, batch["16x16"], states, dsplit(next(key)))
-        wandb.log({"loss": onp.mean(Gloss)})
+        wandb.log({
+            "loss":onp.mean(Gloss),
+            "accuracy":onp.mean(metrics["accuracy"]),
+            "masking":onp.mean(metrics["masking"])
+        })
 
     wandb.finish()
-
 
 if __name__ == "__main__":
     train()
