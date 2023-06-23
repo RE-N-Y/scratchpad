@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jaxtyping import Float, Integer, Array
+from jaxtyping import Float, Integer, Bool, Array
 
 import optax
 import numpy as onp
@@ -59,14 +59,16 @@ class Encoder(Module):
     embedding:Embedding
     wpe:jnp.ndarray
     layernorm:Layernorm
-    head:Projection
-    dr:int = buffer()
+    length:int = buffer()
+    drops:int = buffer()
     cls:int = buffer()
     mask:int = buffer()
     vocab:int = buffer()
 
     def __init__(
         self,
+        length:int=256,
+        droprate:int=0.5,
         features:int=1024,
         heads:int=16,
         vocab:int=8192,
@@ -78,37 +80,33 @@ class Encoder(Module):
         CLS = MASK = 1
         key = RNG(key)
     
-        self.dr = 128
+        self.drops = int(length * droprate)
+        self.length = length
         self.vocab = vocab
         self.cls, self.mask = vocab, vocab + 1
         self.embedding = Embedding(CLS + MASK + vocab, features, key=next(key))
-        self.wpe = jr.normal(next(key), (CLS + 256, features))
+        self.wpe = jr.normal(next(key), (CLS + self.length - self.drops, features))
         self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
         self.layernorm = Layernorm([features])
 
     def sampler(self, x:Integer[Array,"n"], key=None):
         key = RNG(key)
-        mr = 0.25 * jr.truncated_normal(next(key), -0.2, 1.8, dtype=x.dtype) + 0.55
-        idxes = jr.permutation(next(key), jnp.arange(len(x)))
-        
-        drops = idxes[:self.dr]
-        masks = idxes[self.dr:]
-        
-        rolls = jnp.linspace(0.5, 1, len(masks), dtype=x.dtype)
-        keeps = masks[rolls > mr]
-        masks = masks[rolls < mr]
-        masks = jnp.concatenate([drops, masks])
+        CLS, MASK = jnp.array([self.cls]), jnp.array([self.mask])
+        dtype = self.wpe.dtype
 
-        x = x.at[masks].set(self.mask)
+        mr = 0.25 * jr.truncated_normal(next(key), -0.2, 1.8, dtype=dtype) + 0.55
+        rolls = jr.uniform(next(key), [self.drops], minval=0.5, maxval=1, dtype=dtype)
+        idxes = jr.permutation(next(key), jnp.arange(self.length))
+        drops, keeps = idxes[:self.drops], idxes[self.drops:]
+        masks = rolls < mr
+        
         x = x[keeps]
-
-        CLS = jnp.array([self.cls])
-        x = jnp.concatenate([CLS, x])
+        x = jnp.where(masks, MASK, x) 
+        x = jnp.concatenate([CLS, x]) 
 
         return x, masks, keeps, drops         
 
 
-    @forward
     def __call__(self, x: Integer[Array, "n"], key=None):
         key = RNG(key)
 
@@ -127,10 +125,13 @@ class Decoder(Module):
     wpe:jnp.ndarray
     layernorm:Layernorm
     head:Projection
+    length:int=buffer()
+    features:int=buffer()
 
 
     def __init__(
         self,
+        length:int=256,
         channels:int=1024,
         features:int=512,
         heads:int=8,
@@ -141,28 +142,33 @@ class Decoder(Module):
         key=None,
     ):
         key = RNG(key)
+        self.features = features
+        self.length = length
         self.projection = Projection(channels, features, bias=bias, key=next(key))
         self.wpe = jr.normal(next(key), (256, features))
         self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
         self.layernorm = Layernorm([features])
         self.head = Projection(features, vocab, bias=bias, key=next(key))
 
-    @forward
-    def __call__(self, x:Integer[Array,"n"], masks:Integer[Array,"n"], keeps:Integer[Array,"n"], key=None):
+    def __call__(self, x:Integer[Array,"n"], masks:Bool[Array,"n"], keeps:Integer[Array,"n"], drops:Integer[Array,"n"], key=None):
         key = RNG(key)
         x = self.projection(x)
-        CLS, x = x[:,:1], x[:,1:]
+        CLS, x = x[0], x[1:]
 
-        slate = jnp.zeros((256,512), dtype=x.dtype)
-        slate = slate.at[keeps].set(x)
-        slate = slate.at[masks].set(CLS)
+        slate = jnp.zeros((self.length, self.features), dtype=x.dtype)
+        masks = repeat(masks, 'n -> n d', d=self.features)
+        kept = jnp.where(masks, CLS, x)
 
-        x = x + self.wpe
+        slate = slate.at[keeps].set(kept)
+        slate = slate.at[drops].set(CLS)
+        hits = jnp.all(slate == CLS, axis=-1)
+
+        x = slate + self.wpe
         x = self.layers(x, key=next(key))
         x = self.layernorm(x)
         x = self.head(x)
 
-        return x
+        return x, hits
 
 class MAGE(Module):
     encoder:Encoder
@@ -170,14 +176,14 @@ class MAGE(Module):
 
     def __init__(self, features:int=1024, heads:int=16, vocab:int=8192, layers:int=24, dropout:float=0, bias=False, key=None):
         key = RNG(key)
-        self.encoder = Encoder(next(key))
-        self.decoder = Decoder(next(key))
+        self.encoder = Encoder(key=next(key))
+        self.decoder = Decoder(key=next(key))
 
     @forward
     def __call__(self, x:Integer[Array,"n"], key=None):
         key = RNG(key)
-        x, masks, keeps, drops = self.encoder(x, key=next(key))
-        x = self.decoder(x, masks, keeps, key=next(key))
+        x, masks, keeps, drops = self.encoder(x, next(key))
+        x = self.decoder(x, masks, keeps, drops, next(key))
         return x
 
 
@@ -248,10 +254,10 @@ def train(**cfg):
         shuffle=True
     )
 
-    G = Decoder(cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key))
+    G = MAGE(key=next(key))
 
     grads = partial(gradients, precision=cfg["precision"])
-    optimisers = optax.adamw(cfg["lr"], b1=0.9, b2=0.96)
+    optimisers = optax.adabelief(cfg["lr"])
     states = optimisers.init(G)
 
     G, states = replicate(G), replicate(states)
@@ -262,12 +268,12 @@ def train(**cfg):
         
         @grads
         def cross_entropy_loss(G, batch):
-            m = masks(batch, jr.split(next(key), len(batch)))
-            logits = G(batch, m, jr.split(next(key), len(batch)))
+            logits, hits = G(batch, jr.split(next(key), len(batch)))
             labels = jax.nn.one_hot(batch, cfg["vocab"])
             labels = optax.smooth_labels(labels, 0.1)
-            loss = optax.softmax_cross_entropy(logits, labels) * (1 - m)
-            return loss.mean(), {}
+            loss = optax.softmax_cross_entropy(logits, labels) * hits
+            loss = loss.sum() / hits.sum()
+            return loss, {}
 
         (loss, metrics), gradients = cross_entropy_loss(G, batch)
         updates, states = optimisers.update(gradients, states, G)
