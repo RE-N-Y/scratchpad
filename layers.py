@@ -28,6 +28,10 @@ ACTS = {
 FloatArray = Float[Array, "..."]
 IntArray = Integer[Array, "..."]
 
+class Identity(Module):
+    def __init__(self, key=None): pass
+    def __call__(self, x, key=None): return x
+
 class Sequential(Module):
     layers:list
 
