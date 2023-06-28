@@ -24,8 +24,9 @@ def cycle(loader, tensors=[]):
 def dataloader(name:str, tensors=[], transform=[], **kwargs):
     ds = deeplake.load(name)
     loader = ds.pytorch(tensors=tensors, transform=transform, **kwargs)
+    length = len(loader)
     loader = cycle(loader, tensors=tensors)
 
-    return loader
+    return loader, length
 
 
