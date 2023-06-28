@@ -187,6 +187,19 @@ class VQVAE(Module):
         self.decoder = Sequential([*transformers, Layernorm([features]), MLP(features, activation="tanh", dropout=dropout, bias=bias, key=next(key))])
         # pixelshuffle
         self.output = Convolution(features, 3 * patch * patch, 1, bias=bias, key=next(key))
+    
+    @forward
+    def decode(self, idxes:Integer[Array, "n"], key=None):
+        key = RNG(key)
+        ratio = self.size // self.patch
+        codes = self.quantiser.codebook(idxes)
+        codes = self.quantiser.output(codes)
+
+        x = self.decoder(codes + self.dpe, key=next(key))
+        x = rearrange(x, '(h w) c -> h w c', h=ratio, w=ratio)
+        x = rearrange(self.output(x), 'h w (hr wr c) -> (h hr) (w wr) c', hr=self.patch, wr=self.patch)
+
+        return x
 
     @forward
     def __call__(self, x:Float[Array, "h w c"], key=None):
