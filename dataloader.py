@@ -28,5 +28,3 @@ def dataloader(name:str, tensors=[], transform=[], **kwargs):
     loader = cycle(loader, tensors=tensors)
 
     return loader, length
-
-

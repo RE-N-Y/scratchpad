@@ -53,7 +53,6 @@ class Transformer(Module):
 
         return x
 
-
 class Decoder(Module):
     layers: Sequential
     embedding:Embedding
@@ -164,7 +163,7 @@ def accuracy(logits, labels, masks):
 @click.option("--steps", default=256, type=int)
 @click.option("--warmup", default=32, type=int)
 @click.option("--cooldown", type=float, default=224)
-@click.option("--lr", type=float, default=1e-4)
+@click.option("--lr", type=float, default=3e-4)
 @click.option("--batch", default=256, type=int)
 @click.option("--features", type=int, default=768)
 @click.option("--vocab", type=int, default=8192)
@@ -202,6 +201,8 @@ def train(**cfg):
     grads = partial(gradients, precision=cfg["precision"])
     lr = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     optimisers = optax.lion(lr, b1=0.95, b2=0.98, weight_decay=0.1)
+    # lr = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
+    # optimisers = optax.MultiSteps(optimisers, 4)
     states = optimisers.init(parameters(G))
 
     G, states = replicate(G), replicate(states)
