@@ -46,25 +46,40 @@ class Activation(Module):
     def __call__(self, x, key=None):
         return ACTS[self.function](x)
 
-def convolve(x:Float[Array, "b h w c"], w:Float[Array, "h w i o"], stride:int=1, padding=0, groups=1, format=("NHWC", "HWIO", "NHWC")):
-    return jax.lax.conv_general_dilated(x, w, pair(stride), pair(pair(padding)), feature_group_count=groups, dimension_numbers=format)
+def convolve(x:Float[Array, "b h w c"], w:Float[Array, "h w i o"], stride=(1,1), padding=((0,0),(0,0)), groups=1, format=("NHWC", "HWIO", "NHWC")):
+    return jax.lax.conv_general_dilated(x, w, stride, padding, feature_group_count=groups, dimension_numbers=format)
 
 def normalise(x, axis=-1, eps=1e-12):
     return x * jax.lax.rsqrt(jnp.sum(x ** 2, axis=axis, keepdims=True) + eps)
 
+def expand(k, type="kernel"):
+    if type == "kernel" : return pair(k) if isinstance(k, int) else k
+    elif type == "stride" : return pair(k) if isinstance(k, int) else k
+    elif type == "padding" :
+        if isinstance(k, int):
+            return ((k,k),(k,k))
+        elif isinstance(k, tuple):
+            if len(k) == 2 : return ((k[0], k[0]), (k[1], k[1]))
+            elif len(k) == 4 : return ((k[0], k[1]), (k[2], k[3]))
+            else: raise ValueError("Padding must be either an int, a tuple of 2 ints or a tuple of 4 ints")
+        else: raise ValueError("Padding must be either an int, a tuple of 2 ints or a tuple of 4 ints")
+    else: raise ValueError("Type must be either 'kernel', 'stride' or 'padding'")
+
+
 class Convolution(Module):
     weight:jnp.ndarray
     bias:jnp.ndarray
-    kernel:int = buffer()
+    kernel:tuple = buffer()
     stride:int = buffer()
     padding:int = buffer()
     groups:int = buffer()
 
 
     def __init__(self, nin, non, kernel:int=3, stride:int=1, padding:int=0, groups:int=1, bias=True, key=None):
-        self.weight = lecun(key, (kernel, kernel, nin // groups, non))
+        self.weight = lecun(key, (*expand(kernel,"kernel"), nin // groups, non))
         self.bias = jnp.zeros((non,)) if bias else None
-        self.kernel, self.stride, self.padding, self.groups = kernel, stride, padding, groups
+        self.kernel, self.stride, self.padding = expand(kernel,"kernel"), expand(stride,"stride"), expand(padding,"padding")
+        self.groups = groups
 
     def __call__(self, x:Float[Array, "h w c"], key=None):
         x = rearrange(x, 'h w c -> 1 h w c')
