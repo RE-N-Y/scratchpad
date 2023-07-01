@@ -189,6 +189,16 @@ class Up(Module):
         h, w, c = x.shape
         x = jax.image.resize(x, (h * self.factor, w * self.factor, c), method='bilinear')
         return self.sample(x)
+    
+class Down(Module):
+    sample:Convolution
+
+    def __init__(self, nin:int, non:int, factor:int=2, bias=False, key=None):
+        key = RNG(key)
+        self.sample = Convolution(nin, non, kernel=3, stride=factor, padding=1, bias=bias, key=next(key))
+
+    def __call__(self, x:Float[Array, "h w d"], key=None):
+        return self.sample(x)
 
 class VQVAE(Module):
     input:Down
@@ -220,6 +230,7 @@ class VQVAE(Module):
         ])
 
     @forward
+    def __call__(self, x:Float[Array, "h w c"], key=None):
         key = RNG(key)
 
         x = self.input(x)
