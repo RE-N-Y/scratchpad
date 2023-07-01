@@ -19,6 +19,7 @@ import torchvision.transforms as T
 from dataloader import dataloader
 
 
+import deeplake
 import wandb
 import click
 import math
@@ -167,10 +168,6 @@ class Mixer(Module):
     def __call__(self, x:Float[Array, "h w d"], key=None):
         key = RNG(key)
         x = self.mlp(self.layernorm(self.mixer(x), key=next(key)), key=next(key)) + x
-        return x
-
-class Down(Module):
-    sample:Convolution
 
     def __init__(self, nin:int, non:int, factor:int=2, bias=False, key=None):
         key = RNG(key)
@@ -200,7 +197,7 @@ class VQVAE(Module):
     decoder:Sequential
     output:Up
 
-    def __init__(self, features:int=96, codes:int=32, pages:int=8192, depth:int=3, dropout:float=0, bias=True, key=None):
+    def __init__(self, features:int=128, codes:int=32, pages:int=8192, depth:int=4, dropout:float=0, bias=True, key=None):
         key = RNG(key)
 
         self.input = Sequential([
@@ -209,20 +206,20 @@ class VQVAE(Module):
         self.encoder = Sequential([
             *[Mixer(features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Down(features, 2 * features, bias=bias, key=next(key)),
             *[Mixer(2 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Down(2 * features, 4 * features, bias=bias, key=next(key)),
+            *[Mixer(4 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Down(4 * features, 4 * features, bias=bias, key=next(key)),
             *[Mixer(4 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
         ])
+
         self.quantiser = VectorQuantiser(4 * features, codes, pages, bias=bias, key=next(key))
+
         self.decoder = Sequential([
             *[Mixer(4 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Up(4 * features, 2 * features, bias=bias, key=next(key)),
-            *[Mixer(2 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Up(2 * features, features, bias=bias, key=next(key)),
+            *[Mixer(4 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Up(4 * features, 2 * features, bias=bias, key=next(key)), 
+            *[Mixer(2 * features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)], Up(2 * features, features, bias=bias, key=next(key)), 
             *[Mixer(features, dropout=dropout, bias=bias, key=next(key)) for _ in range(depth)]
-        ])
-        self.output = Sequential([
-            Up(features, 3, bias=bias, key=next(key))
         ])
 
     @forward
-    def __call__(self, x:Float[Array, "h w c"], key=None):
         key = RNG(key)
 
         x = self.input(x)
@@ -243,6 +240,51 @@ def t2i(x:Float[Array, "b h w c"]) -> onp.ndarray:
     x = x * 0.5 + 0.5
     x = onp.asarray(x * 255, dtype=onp.uint8)
     return x
+
+
+@click.command()
+@click.option("--batch", default=64, type=int)
+@click.option("--size", default=256, type=int)
+@click.option("--features", type=int, default=768)
+@click.option("--pages", type=int, default=8192)
+@click.option("--heads", type=int, default=12)
+@click.option("--depth", type=int, default=12)
+@click.option("--dropout", type=float, default=0)
+@click.option("--bias", type=bool, default=False)
+@click.option("--seed", type=int, default=42)
+@click.option("--workers", type=int, default=16)
+@click.option("--checkpoint", type=Path)
+def encode(**cfg):
+    key = jr.PRNGKey(cfg["seed"])
+    key = RNG(key)
+    dsplit = lambda key : jr.split(key, jax.device_count())
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Resize(cfg["size"], antialias=True),
+        T.ConvertImageDtype(torch.float), 
+        T.Normalize(0.5, 0.5)
+    ])
+
+    model = VQVAE(cfg["features"], pages=cfg["pages"], dropout=cfg["dropout"], bias=cfg["bias"], depth=cfg["depth"], key=next(key))
+    model = load(cfg["checkpoint"] / "G.weight", model)
+    model = replicate(model)
+
+    ds = deeplake.load("hub://reny/animefaces")
+    ds.create_tensor("64x64")
+    loader = ds.pytorch(tensors=["images"], transform={"images":transform}, batch_size=cfg["batch"], num_workers=cfg["workers"], shuffle=False)
+    
+    @ddp
+    def quantise(G, images, key=None):
+        fakes, codes, loss, idxes = G(images, jr.split(key, len(images)))
+        return codes, idxes
+
+    with ds:
+        for batch in tqdm(loader):
+            batch = rearrange(batch["images"], "... c h w -> ... h w c")
+            batch = jnp.asarray(batch)
+            codes, idxes = quantise(model, batch, dsplit(next(key)))
+            codes, idxes = rearrange(codes, "n mb ... -> (n mb) ..."), rearrange(idxes, "n mb ... -> (n mb) ...")
+            ds["64x64"].extend(onp.asarray(idxes))
 
 @click.command()
 @click.option("--dataset", type=Path)
@@ -290,7 +332,7 @@ def train(**cfg):
 
     lpips = LPIPS.load()
     grads = partial(gradients, precision=cfg["precision"])
-    G = VQVAE(cfg["features"], pages=cfg["pages"], dropout=cfg["dropout"], bias=cfg["bias"], key=next(key))
+    G = VQVAE(cfg["features"], pages=cfg["pages"], depth=cfg["depth"], dropout=cfg["dropout"], bias=cfg["bias"], key=next(key))
 
     Goptim = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
     Goptim = optax.adabelief(Goptim)
@@ -349,4 +391,4 @@ def train(**cfg):
     wandb.finish()
 
 if __name__ == "__main__":
-    train()
+    encode()
