@@ -316,7 +316,6 @@ def train(**cfg):
         G = load(cfg["checkpoint"] / "G.weight", G)
         Gstates = load(cfg["checkpoint"] / "states.ckpt", Gstates)
 
-
     G, Gstates = replicate(G), replicate(Gstates)
 
     @ddp

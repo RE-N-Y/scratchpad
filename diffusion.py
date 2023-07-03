@@ -20,22 +20,19 @@ save = equinox.tree_serialise_leaves
 class Imageformer(Module):
     attention:SelfAttention
     mlp:GLU
-    temb:Projection
     prenorm:Layernorm
     postnorm:Layernorm
 
-    def __init__(self, features:int, time:int=256, heads:int=12, bias=False, dropout:float=0, key=None):
+    def __init__(self, features:int, heads:int=12, bias=False, dropout:float=0, key=None):
         key = RNG(key)
         self.prenorm, self.postnorm = Layernorm([features]), Layernorm([features])
         self.attention = SelfAttention(features, heads=heads, dropout=dropout, bias=bias, key=next(key))
         self.mlp = GLU(features, dropout=dropout, bias=bias, key=next(key))
-        self.temb = Projection(time, features, bias=bias, key=next(key))
 
-    def __call__(self, x, t, key=None):
+    def __call__(self, x, key=None):
         key = RNG(key)
-        t = self.temb(t)
-        x = self.attention(self.prenorm(x + t), key=next(key)) + x
-        x = self.mlp(self.postnorm(x + t), key=next(key)) + x
+        x = self.attention(self.prenorm(x), key=next(key)) + x
+        x = self.mlp(self.postnorm(x), key=next(key)) + x
         
         return x
 
@@ -44,23 +41,29 @@ class Denoiser(Module):
     temb:GLU
     wpe:jnp.ndarray
     inputs:Convolution
-    layers:Sequential
+    encoder:list
+    decoder:list
+    connections:list
+    layernorm:Layernorm
     mlp:Sequential
     outputs:Convolution
     patch:int = buffer()
     ratio:int = buffer()
 
-    def __init__(self, features:int=768, time:int=256, patch:int=4, depth:int=24, heads:int=12, size:int=64, bias=True, key=None):
+    def __init__(self, features:int=768, patch:int=4, depth:int=12, heads:int=12, size:int=64, bias=True, key=None):
         key = RNG(key)
         
         self.patch = patch
         self.ratio = size // patch
-        self.tpe = SinusodialEmbedding(time, key=next(key))
-        self.temb = GLU(time, bias=bias, key=next(key))
+        self.tpe = SinusodialEmbedding(features, key=next(key))
+        self.temb = GLU(features, bias=bias, key=next(key))
         self.wpe = jnp.zeros(((size // patch) ** 2, features))
 
         self.inputs = Convolution(3, features, patch, stride=patch, bias=bias, key=next(key))
-        self.layers = [Imageformer(features, time=time, heads=heads, bias=bias, key=next(key)) for _ in range(depth)]
+        self.encoder = [Imageformer(features, heads=heads, bias=bias, key=next(key)) for _ in range(depth)]
+        self.decoder = [Imageformer(features, heads=heads, bias=bias, key=next(key)) for _ in range(depth)]
+        self.connections = [Projection(2 * features, features, bias=bias, key=next(key)) for _ in range(depth)]
+        self.layernorm = Layernorm([features])
         self.mlp = Sequential([Layernorm([features]), MLP(features, activation="tanh", bias=bias, key=next(key))])
         self.outputs = Convolution(features, 3 * patch * patch, kernel=1, bias=bias, key=next(key))
 
@@ -68,12 +71,27 @@ class Denoiser(Module):
     def __call__(self, x, t, key=None):
         key = RNG(key)
 
+        T = 1
         t = self.tpe(t.astype(x.dtype))
         t = self.temb(t, key=next(key))
 
+        t = rearrange(t, 't -> () t')
         x = rearrange(self.inputs(x), 'h w c -> (h w) c')
+        
         x = x + self.wpe
-        for layer in self.layers: x = layer(x, t, key=next(key))
+        x, _ = pack([x, t], '* d')
+
+        hiddens = []
+        for layer in self.encoder:
+            x = layer(x, key=next(key))
+            hiddens.append(x)
+
+        for layer, connection, hidden in zip(self.decoder, self.connections, reversed(hiddens)):
+            x, _ = pack([x, hidden], 'n *')
+            x = connection(x, key=next(key))
+            x = layer(x, key=next(key))
+
+        x = self.layernorm(x[T:])
         x = self.mlp(x, key=next(key))
         
         x = rearrange(x, '(h w) c -> h w c', h=self.ratio, w=self.ratio)
@@ -172,13 +190,12 @@ from PIL import Image
 @click.option("--steps", default=64, type=int)
 @click.option("--warmup", default=8)
 @click.option("--cooldown", default=64)
-@click.option("--lr", type=float, default=5e-6)
+@click.option("--lr", type=float, default=3e-4)
 @click.option("--batch", default=128, type=int)
 @click.option("--seed", default=42, type=int)
 @click.option("--features", default=1024, type=int)
-@click.option("--patch", default=4, type=int)
-@click.option("--time", default=256, type=int)
-@click.option("--depth", default=32, type=int)
+@click.option("--patch", default=2, type=int)
+@click.option("--depth", default=12, type=int)
 @click.option("--channels", type=int, default=3)
 @click.option("--heads", type=int, default=16)
 @click.option("--bias", type=bool, default=True)
@@ -213,7 +230,7 @@ def train(**cfg):
     )
 
     grads = partial(gradients, precision=cfg["precision"])    
-    D = Denoiser(features=cfg["features"], time=cfg["time"], depth=cfg["depth"], heads=cfg["heads"], patch=cfg["patch"], key=next(key))
+    D = Denoiser(features=cfg["features"], depth=cfg["depth"], heads=cfg["heads"], patch=cfg["patch"], key=next(key))
 
     cfg["warmup"], cfg["steps"], cfg["cooldown"] = cfg["warmup"] * length, cfg["steps"] * length, cfg["cooldown"] * length
     grads = partial(gradients, precision=cfg["precision"])
