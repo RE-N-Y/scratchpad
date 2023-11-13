@@ -320,11 +320,7 @@ def train(**cfg):
     grads = partial(gradients, precision=cfg["precision"])
     sampler = Diffusion(steps=1024)
     
-    # C = ViTQuantiser.load(cfg["compressor"])
     D = UNet(features=[16,32,64,128], channels=3, heads=cfg["heads"], bias=cfg["bias"], key=next(key))
-    # D = Transformer(cfg["length"], channels=cfg["channels"], features=cfg["features"], heads=cfg["heads"], depth=cfg["depth"], dropout=cfg["dropout"], bias=cfg["bias"], key=next(key))
-    # D = adjust(D, depth=cfg["depth"], key=next(key))
-
     optimisers = optax.adamw(cfg["lr"])
     states = optimisers.init(D)
 
@@ -341,8 +337,6 @@ def train(**cfg):
             noise = denoise(xt, t, key=next(key))
             xt = sampler.psample(xt, t, noise, key=next(key))
 
-        # images = C.decode(rearrange(xt, 'b h w c -> b (h w) c'), key=next(key))
-        # images = rearrange(images, '(n m) h w c -> (n h) (m w) c', n=4, m=4)
         xt = rearrange(xt, '(n m) h w c -> (n h) (m w) c', n=2, m=2)
         image = dataset.tensor_to_image(xt)
         image.save(folder / "samples.png")
@@ -355,8 +349,6 @@ def train(**cfg):
         def loss(D, sampler, images):
             z = images
             b, *_ = images.shape
-            # (_, z, c, _), idxes = C.encode(images, key=next(key))
-            # z = rearrange(z, 'b (h w) c -> b h w c', h=32, w=32)
             noise = jr.normal(next(key), z.shape, dtype=z.dtype)
 
             t = jr.randint(next(key), (b,), 0, 1024)

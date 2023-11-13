@@ -6,7 +6,7 @@ from jaxtyping import Float, Integer, Array
 import optax
 import numpy as onp
 import equinox
-from equinox import nn, static_field, Module
+from equinox import nn, static_field as buffer, Module
 from einops import rearrange, reduce, repeat, pack
 from layers import (
     Convolution,
@@ -53,9 +53,77 @@ class Transformer(Module):
 
         return x
 
-class Decoder(Module):
+
+class Encoder(Module):
     layers: Sequential
     embedding:Embedding
+    wpe:jnp.ndarray
+    layernorm:Layernorm
+    head:Projection
+    dr:int = buffer()
+    cls:int = buffer()
+    mask:int = buffer()
+    vocab:int = buffer()
+
+    def __init__(
+        self,
+        features:int=1024,
+        heads:int=16,
+        vocab:int=8192,
+        layers:int=24,
+        dropout:float=0,
+        bias=False,
+        key=None,
+    ):
+        CLS = MASK = 1
+        key = RNG(key)
+    
+        self.dr = 128
+        self.vocab = vocab
+        self.cls, self.mask = vocab, vocab + 1
+        self.embedding = Embedding(CLS + MASK + vocab, features, key=next(key))
+        self.wpe = jr.normal(next(key), (CLS + 256, features))
+        self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
+        self.layernorm = Layernorm([features])
+
+    def sampler(self, x:Integer[Array,"n"], key=None):
+        key = RNG(key)
+        mr = 0.25 * jr.truncated_normal(next(key), -0.2, 1.8, dtype=x.dtype) + 0.55
+        idxes = jr.permutation(next(key), jnp.arange(len(x)))
+        
+        drops = idxes[:self.dr]
+        masks = idxes[self.dr:]
+        
+        rolls = jnp.linspace(0.5, 1, len(masks), dtype=x.dtype)
+        keeps = masks[rolls > mr]
+        masks = masks[rolls < mr]
+        masks = jnp.concatenate([drops, masks])
+
+        x = x.at[masks].set(self.mask)
+        x = x[keeps]
+
+        CLS = jnp.array([self.cls])
+        x = jnp.concatenate([CLS, x])
+
+        return x, masks, keeps, drops         
+
+
+    @forward
+    def __call__(self, x: Integer[Array, "n"], key=None):
+        key = RNG(key)
+
+        x, masks, keeps, drops = self.sampler(x, next(key))
+        x = self.embedding(x)
+        x = x + self.wpe
+        
+        x = self.layers(x, key=next(key))
+        x = self.layernorm(x)
+
+        return x, masks, keeps, drops
+
+class Decoder(Module):
+    layers:Sequential
+    projection:Projection
     wpe:jnp.ndarray
     layernorm:Layernorm
     head:Projection
@@ -63,66 +131,55 @@ class Decoder(Module):
 
     def __init__(
         self,
-        features: int,
-        vocab: int = 8192,
-        layers: int = 24,
-        dropout: float = 0,
+        channels:int=1024,
+        features:int=512,
+        heads:int=8,
+        vocab:int=8192,
+        layers:int=8,
+        dropout:float=0,
         bias=False,
         key=None,
     ):
         key = RNG(key)
-        self.embedding = Embedding(vocab, features, key=next(key))
+        self.projection = Projection(channels, features, bias=bias, key=next(key))
         self.wpe = jr.normal(next(key), (256, features))
-        self.layers = Sequential(
-            [
-                Transformer(features, dropout=dropout, bias=bias, key=next(key))
-                for _ in range(layers)
-            ]
-        )
+        self.layers = Sequential([Transformer(features, heads=heads, dropout=dropout, bias=bias, key=next(key)) for _ in range(layers)])
         self.layernorm = Layernorm([features])
         self.head = Projection(features, vocab, bias=bias, key=next(key))
 
-    def masking(self, confidences, masklen, tau=1, key=None):
-        confidences = jnp.log(confidences) + tau * jr.gumbel(key, confidences.shape)
-        sorted = jnp.sort(confidences, axis=-1)
-        cutoff = sorted[...,masklen]
-        return confidences < repeat(cutoff, 'b -> b 256')
-
-
-    def generate(self, n:int, T:int=16, tau=0.7, key=None):
-        key = RNG(key)
-        
-        offset = 1
-        x = jr.randint(next(key), (n, 256), minval=0, maxval=8192)
-        masks = jnp.zeros((n, 256), dtype=int)
-        schedule = lambda r : math.cos(0.5 * math.pi * r)
-        masklens = [ [t/T, math.ceil(schedule(t/T) * 256)] for t in range(offset, T + offset)]
-       
-        for ratio, masklen in tqdm(masklens):
-            logits = self(x, masks, jr.split(next(key),n))
-            tokens = jr.categorical(next(key), logits)
-
-            p = jax.nn.softmax(logits, axis=-1)
-            p, tokens = rearrange(p, 'b n c -> (b n) c'), rearrange(tokens, 'b n -> (b n)')
-            confidences = batch(lambda x,idx:x[idx])(p, tokens)
-            tokens, confidences = rearrange(tokens, '(b n) -> b n', b=n), rearrange(confidences, '(b n) -> b n', b=n)
-            
-            # confidences = jnp.where(masks == 0, confidences, jnp.inf)
-            x = jnp.where(masks == 0, tokens, x)
-            masks = jnp.where(self.masking(confidences, masklen, tau=(1-ratio)*tau, key=next(key)), 0, 1)
-            
-        return x
-
     @forward
-    def __call__(self, x: Integer[Array, "n"], masks: Integer[Array, "n"], key=None):
-        x = self.embedding(x)
-        x = jnp.where(rearrange(masks == 1, 'n -> n 1'), x, jnp.zeros(x.shape, x.dtype))
+    def __call__(self, x:Integer[Array,"n"], masks:Integer[Array,"n"], keeps:Integer[Array,"n"], key=None):
+        key = RNG(key)
+        x = self.projection(x)
+        CLS, x = x[:,:1], x[:,1:]
+
+        slate = jnp.zeros((256,512), dtype=x.dtype)
+        slate = slate.at[keeps].set(x)
+        slate = slate.at[masks].set(CLS)
+
         x = x + self.wpe
-        x = self.layers(x, key=key)
+        x = self.layers(x, key=next(key))
         x = self.layernorm(x)
         x = self.head(x)
 
         return x
+
+class MAGE(Module):
+    encoder:Encoder
+    decoder:Decoder
+
+    def __init__(self, features:int=1024, heads:int=16, vocab:int=8192, layers:int=24, dropout:float=0, bias=False, key=None):
+        key = RNG(key)
+        self.encoder = Encoder(next(key))
+        self.decoder = Decoder(next(key))
+
+    @forward
+    def __call__(self, x:Integer[Array,"n"], key=None):
+        key = RNG(key)
+        x, masks, keeps, drops = self.encoder(x, key=next(key))
+        x = self.decoder(x, masks, keeps, key=next(key))
+        return x
+
 
 import math
 import wandb
@@ -133,36 +190,33 @@ from functools import partial
 from PIL import Image
 
 
-def schedule(ratio):
+def sample(ratio):
     return jnp.cos(0.5 * jnp.pi * ratio)
 
 
 @batch
 def masks(idxes, key=None):
     key = RNG(key)
-    ratio = schedule(jr.uniform(next(key)))
+    ratio = sample(jr.uniform(next(key)))
     masks = jr.uniform(next(key), idxes.shape)
     masks = jnp.where(masks > ratio, 1, 0)  # 1 = NO MASK, 0 = MASK
-    masks = masks.at[0].set(0)
-    masks = jr.permutation(next(key), masks)
 
     return masks
 
 @batch
 def accuracy(logits, labels, masks):
-    imasks = 1 - masks
     logits = jnp.argmax(logits, axis=-1)
-    correct = jnp.sum(jnp.where(logits == labels, 1, 0) * imasks)
-    total = jnp.sum(imasks)
+    correct = jnp.sum(jnp.where(logits == labels, 1, 0) * masks)
+    total = jnp.sum(masks)
     return correct / total
 
 
 @click.command()
 @click.option("--dataset", type=Path)
 @click.option("--compressor", type=Path)
-@click.option("--steps", default=256, type=int)
-@click.option("--warmup", default=32, type=int)
-@click.option("--cooldown", type=float, default=224)
+@click.option("--steps", default=1000042, type=int)
+@click.option("--warmup", default=4096, type=int)
+@click.option("--cooldown", type=float, default=1e-6)
 @click.option("--lr", type=float, default=3e-4)
 @click.option("--batch", default=256, type=int)
 @click.option("--features", type=int, default=768)
@@ -185,30 +239,27 @@ def train(**cfg):
     def tform(sample):
         return onp.array(sample)
 
-    loader, length = dataloader(
+    loader = dataloader(
         "hub://reny/animefaces", 
         tensors=["16x16"], 
         batch_size=cfg["batch"],
         transform={"16x16":tform},
-        num_workers=cfg["workers"],
-        buffer_size=8192,
+        num_workers=cfg["workers"], 
         shuffle=True
     )
 
     G = Decoder(cfg["features"], cfg["vocab"], cfg["depth"], cfg["dropout"], key=next(key))
-    
-    cfg["warmup"], cfg["steps"], cfg["cooldown"] = cfg["warmup"] * length, cfg["steps"] * length, cfg["cooldown"] * length
+
     grads = partial(gradients, precision=cfg["precision"])
-    lr = optax.warmup_cosine_decay_schedule(0, cfg["lr"], cfg["warmup"], cfg["steps"], cfg["cooldown"])
-    optimisers = optax.lion(lr, b1=0.95, b2=0.98, weight_decay=0.1)
-    states = optimisers.init(parameters(G))
+    optimisers = optax.adamw(cfg["lr"], b1=0.9, b2=0.96)
+    states = optimisers.init(G)
 
     G, states = replicate(G), replicate(states)
 
     @ddp
     def Gstep(G, batch, states, key=None):
         key = RNG(key)
-
+        
         @grads
         def cross_entropy_loss(G, batch):
             m = masks(batch, jr.split(next(key), len(batch)))
@@ -216,9 +267,7 @@ def train(**cfg):
             labels = jax.nn.one_hot(batch, cfg["vocab"])
             labels = optax.smooth_labels(labels, 0.1)
             loss = optax.softmax_cross_entropy(logits, labels) * (1 - m)
-            loss = jnp.sum(loss) / jnp.sum(1 - m)
-
-            return loss, { "accuracy" : accuracy(logits, batch, m), "masking" : 1 - m }
+            return loss.mean(), {}
 
         (loss, metrics), gradients = cross_entropy_loss(G, batch)
         updates, states = optimisers.update(gradients, states, G)
@@ -229,11 +278,7 @@ def train(**cfg):
     for idx in tqdm(range(cfg["steps"])):
         batch = next(loader)
         G, states, Gloss, metrics = Gstep(G, batch["16x16"], states, dsplit(next(key)))
-        wandb.log({
-            "loss":onp.mean(Gloss),
-            "accuracy":onp.mean(metrics["accuracy"]),
-            "masking":onp.mean(metrics["masking"])
-        })
+        wandb.log({"loss": onp.mean(Gloss)})
 
         if idx % 4096 == 0:
             save(folder / "G.weight", unreplicate(G))
@@ -242,26 +287,5 @@ def train(**cfg):
     wandb.finish()
 
 
-import compression as Q
-
-@click.command()
-@click.option("--denoiser", type=Path)
-@click.option("--compressor", type=Path)
-@click.option("--seed", type=int, default=42)
-def generate(denoiser:Path, compressor:Path, seed:int=42):
-    seed = jr.PRNGKey(seed)
-    key = RNG(seed)
-    wandb.init(project="MASKGIT")
-
-    VQ = Q.VQVAE(features=768, pages=8192, depth=12, dropout=0., bias=False, size=256, key=next(key))
-    VQ = load(compressor / "G.weight", VQ)
-    G = Decoder(features=768, vocab=8192, layers=24, dropout=0., key=next(key))
-    G = load(denoiser / "G.weight", G)
-
-    tokens = G.generate(n=64, T=12, tau=4, key=next(key))
-    images = VQ.decode(tokens, jr.split(next(key), 64))
-    wandb.log({ "samples": [wandb.Image(i) for i in Q.t2i(images)] }) 
-    wandb.finish()
-
 if __name__ == "__main__":
-    generate()
+    train()

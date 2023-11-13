@@ -11,8 +11,9 @@ from PIL import Image
 import pickle as pkl
 from pathlib import Path
 
-# ImageNet [0.485, 0.456, 0.406] [0.229, 0.224, 0.225]
-# Animefaces [0.00268127, 0.00241666, 0.002342] [1.2911796 , 1.2961912 , 1.25518782]
+# Dataset statistics
+# ImageNet [0.485, 0.456, 0.406] [0.229, 0.224, 0.225] 0 ~ 1
+# Animefaces [0.00268127, 0.00241666, 0.002342] [1.2911796 , 1.2961912 , 1.25518782] -1 ~ 1
 
 def cycle(loader, tensors=[]):
     while True:

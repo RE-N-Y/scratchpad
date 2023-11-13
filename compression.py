@@ -377,4 +377,4 @@ def train(**cfg):
     wandb.finish()
 
 if __name__ == "__main__":
-    encode()
+    train()
